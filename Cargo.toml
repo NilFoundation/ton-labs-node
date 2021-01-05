@@ -64,7 +64,7 @@ ton_block_json = { git = "https://github.com/tonlabs/ton-labs-block-json.git" }
 ton_executor = { git = "https://github.com/tonlabs/ton-labs-executor" }
 ton-node-storage = { git = "https://github.com/tonlabs/ton-labs-node-storage.git" }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types" }
-ton_vm = { git = "https://github.com/tonlabs/ton-labs-vm" }
+ton_vm = { git = "https://github.com/nilfoundation/rust-ton-vm", branch = "1-vergrth16-tvm-instruction" }
 validator_session = { path = "validator-session" }
 
 [target.'cfg(windows)'.dependencies.rdkafka]
