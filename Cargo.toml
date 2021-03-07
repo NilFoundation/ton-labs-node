@@ -61,10 +61,10 @@ rldp = { git = "https://github.com/tonlabs/ton-labs-rldp" }
 ton_api = { git = "https://github.com/tonlabs/ton-labs-tl", package = "ton_api" }
 ton_block = { git = "https://github.com/tonlabs/ton-labs-block" }
 ton_block_json = { git = "https://github.com/tonlabs/ton-labs-block-json.git" }
-ton_executor = { git = "https://github.com/tonlabs/ton-labs-executor" }
+ton_executor = { git = "https://github.com/nilfoundation/ton-executor", branch = "1-vergrth16"}
 ton-node-storage = { git = "https://github.com/tonlabs/ton-labs-node-storage.git" }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types" }
-ton_vm = { git = "https://github.com/nilfoundation/rust-ton-vm", branch = "1-vergrth16-tvm-instruction" }
+ton_vm = { git = "https://github.com/nilfoundation/rust-tvm", branch = "1-vergrth16-tvm-instruction" }
 validator_session = { path = "validator-session" }
 
 crusty3-zk = { git = "https://github.com/nilfoundation/crusty3-zk" }
