@@ -1207,9 +1207,6 @@ pub trait SessionProcessor: CompletionHandlerProcessor + fmt::Display {
     /// Notify about incoming broadcasts
     fn process_broadcast(&mut self, source_id: PublicKeyHash, data: BlockPayloadPtr);
 
-    /// Notify about incoming message
-    fn process_message(&mut self, source_id: PublicKeyHash, data: BlockPayloadPtr);
-
     /// Notify about incoming query
     fn process_query(
         &mut self,
@@ -1226,6 +1223,9 @@ pub trait SessionProcessor: CompletionHandlerProcessor + fmt::Display {
 
     /// Set next awake time
     fn set_next_awake_time(&mut self, timestamp: std::time::SystemTime);
+
+    /// Reset next awake time
+    fn reset_next_awake_time(&mut self);
 
     /// Get next awake time
     fn get_next_awake_time(&self) -> std::time::SystemTime;
@@ -1387,13 +1387,15 @@ impl SessionFactory {
     }
 
     /// Create task queue
-    pub fn create_task_queue() -> TaskQueuePtr {
-        session::SessionImpl::create_task_queue()
+    pub fn create_task_queue(metrics_receiver: Arc<metrics_runtime::Receiver>) -> TaskQueuePtr {
+        session::SessionImpl::create_task_queue(metrics_receiver)
     }
 
     /// Create session callbacks task queue
-    pub fn create_callback_task_queue() -> CallbackTaskQueuePtr {
-        session::SessionImpl::create_callback_task_queue()
+    pub fn create_callback_task_queue(
+        metrics_receiver: Arc<metrics_runtime::Receiver>,
+    ) -> CallbackTaskQueuePtr {
+        session::SessionImpl::create_callback_task_queue(metrics_receiver)
     }
 
     /// Create session

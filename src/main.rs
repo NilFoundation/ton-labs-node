@@ -1,41 +1,41 @@
-pub mod block;
-pub mod block_proof;
-pub mod boot;
-pub mod collator;
+mod block;
+mod block_proof;
+mod boot;
+mod collator_test_bundle;
 pub mod config;
-pub mod db;
-pub mod engine;
-pub mod engine_traits;
-pub mod engine_operations;
-pub mod error;
-pub mod full_node;
-pub mod macros;
+mod engine;
+mod engine_traits;
+mod engine_operations;
+mod error;
+mod full_node;
+mod internal_db;
+mod macros;
 pub mod network;
-pub mod out_msg_queue;
-pub mod shard_state;
-pub mod sync;
-pub mod types;
-pub mod validator;
-pub mod shard_blocks;
-pub mod validating_utils;
-pub mod rng;
-pub mod collator_test_bundle;
+mod out_msg_queue;
+mod rng;
+mod shard_blocks;
+mod shard_state;
+mod sync;
+mod types;
+mod validating_utils;
+mod validator;
 
 #[cfg(feature = "tracing")]
-pub mod jaeger;
+mod jaeger;
 
 #[cfg(not(feature = "tracing"))]
-pub mod jaeger {
+mod jaeger {
     pub fn init_jaeger(){}
+    #[cfg(feature = "external_db")]
     pub fn message_from_kafka_received(_kf_key: &[u8]) {}
     pub fn broadcast_sended(_msg_id: String) {}
 }
 
-extern crate lazy_static;
+//extern crate lazy_static;
 
 #[cfg(feature = "external_db")]
 mod external_db;
-pub mod ext_messages;
+mod ext_messages;
 
 use crate::{config::TonNodeConfig, engine_traits::ExternalDb, engine::STATSD, jaeger::init_jaeger};
 use clap;
@@ -144,9 +144,9 @@ fn start_external_db(_config: &TonNodeConfig) -> Result<Vec<Arc<dyn ExternalDb>>
     Ok(vec!())
 }
 
-async fn start_engine(config: TonNodeConfig, zerostate_path: Option<&str>) -> Result<()> {
+async fn start_engine(config: TonNodeConfig, zerostate_path: Option<&str>, initial_sync_disabled: bool) -> Result<()> {
     let external_db = start_external_db(&config)?;
-    crate::engine::run(config, zerostate_path, external_db).await?;
+    crate::engine::run(config, zerostate_path, external_db, initial_sync_disabled).await?;
     Ok(())
 }
 
@@ -170,28 +170,27 @@ fn main() {
             .short("k")
             .long("--ckey")
             .value_name("console_key")
-            .help("use console key in json format"));
+            .help("use console key in json format"))
+        .arg(clap::Arg::with_name("initial_sync_disabled")
+            .short("i")
+            .long("--initial-sync-disabled"))
+            .help("use this flag to sync from zero_state");
 
     let matches = app.get_matches();
+
+    let initial_sync_disabled = matches.is_present("initial_sync_disabled");
 
     let config_dir_path = match matches.value_of("config") {
         Some(config) => {
             config
-        },
+        }
         None => {
             println!("Can't load config: config dir is not set!");
             return;
         }
     };
 
-    let console_key = match matches.value_of("console_key") {
-        Some(console_key) => {
-            Some(console_key.to_string())
-        },
-        None => {
-            None
-        }
-    };
+    let console_key = matches.value_of("console_key").map(|console_key| console_key.to_string());
 
     let zerostate_path = matches.value_of("zerostate");
     let config = match TonNodeConfig::from_file(
@@ -223,7 +222,7 @@ fn main() {
     init_jaeger();
     
     runtime.block_on(async move {
-        if let Err(e) = start_engine(config, zerostate_path).await {
+        if let Err(e) = start_engine(config, zerostate_path, initial_sync_disabled).await {
             log::error!("Can't start node's Engine: {:?}", e);
         }
     });

@@ -1,24 +1,21 @@
 use crate::{
-    block::BlockStuff,
-    shard_state::ShardStateStuff,
-    block_proof::BlockProofStuff,
+    block::BlockStuff, block_proof::BlockProofStuff, 
+    config::CollatorTestBundlesGeneralConfig,
     engine::{Engine, LastMcBlockId, ShardsClientMcBlockId, STATSD},
-    engine_traits::{EngineOperations, PrivateOverlayOperations},
-    db::{BlockHandle, NodeState},
-    error::NodeError,
-    network::full_node_client::Attempts,
-    types::top_block_descr::TopBlockDescrStuff,
+    engine_traits::{EngineOperations, PrivateOverlayOperations}, error::NodeError,
+    internal_db::NodeState, 
+    shard_state::ShardStateStuff, types::top_block_descr::{TopBlockDescrStuff, TopBlockDescrId},
 };
-
 use adnl::common::KeyOption;
 use catchain::{
     CatchainNode, CatchainOverlay, CatchainOverlayListenerPtr, CatchainOverlayLogReplayListenerPtr
 };
 use overlay::PrivateOverlayShortId;
 use std::{sync::Arc, ops::Deref, convert::TryInto};
-use ton_types::{fail, error, Result, UInt256};
+use storage::types::BlockHandle;
 use ton_api::ton::ton_node::broadcast::BlockBroadcast;
 use ton_block::{BlockIdExt, AccountIdPrefixFull, ShardIdent, Message, SHARD_FULL, MASTERCHAIN_ID};
+use ton_types::{fail, error, Result, UInt256};
 
 #[async_trait::async_trait]
 impl EngineOperations for Engine {
@@ -60,15 +57,15 @@ impl EngineOperations for Engine {
         self.validator_network().stop_catchain_client(overlay_short_id)
     }
 
-    fn load_block_handle(&self, id: &BlockIdExt) -> Result<Arc<BlockHandle>> {
+    fn load_block_handle(&self, id: &BlockIdExt) -> Result<Option<Arc<BlockHandle>>> {
         self.db().load_block_handle(id)
     }
 
     async fn load_applied_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
         // TODO make cache?
-        if handle.applied() {
+        if handle.is_applied() {
             self.load_block(handle).await
-        } else if handle.data_inited() {
+        } else if handle.has_data() {
             fail!("Block is not applied yet")
         } else {
             fail!("No block")
@@ -83,32 +80,36 @@ impl EngineOperations for Engine {
         self.db().load_block_data_raw(handle).await
     }
 
-    async fn wait_applied_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
-        if handle.applied() {
-            self.load_block(handle).await
-        } else {
-            self.block_applying_awaiters().wait(handle.id()).await?;
-            self.load_block(handle).await
+    async fn wait_applied_block(&self, id: &BlockIdExt, timeout_ms: Option<u64>) -> Result<(Arc<BlockHandle>, BlockStuff)> {
+        loop {
+            if let Some(handle) = self.load_block_handle(id)? {
+                if handle.is_applied() {
+                    let block = self.load_block(&handle).await?;
+                    return Ok((handle, block))
+                }
+            }
+            self.block_applying_awaiters().wait(id, timeout_ms).await?;
         }
     }
 
-    async fn wait_next_applied_mc_block(&self, prev_handle: &BlockHandle) -> Result<(Arc<BlockHandle>, BlockStuff)> {
+    async fn wait_next_applied_mc_block(
+        &self, 
+        prev_handle: &BlockHandle,
+        timeout_ms: Option<u64>
+    ) -> Result<(Arc<BlockHandle>, BlockStuff)> {
         if !prev_handle.id().shard().is_masterchain() {
             fail!(NodeError::InvalidArg("`prev_handle` doesn't belong masterchain".to_string()))
         }
         loop {
-            if prev_handle.next1_inited() {
+            if prev_handle.has_next1() {
                 let id = self.load_block_next1(prev_handle.id()).await?;
-                let handle = self.load_block_handle(&id)?;
-                let block = self.wait_applied_block(&handle).await?;
-                break Ok((handle, block))
+                return self.wait_applied_block(&id, timeout_ms).await
             } else {
-                if let Some(id) = self.next_block_applying_awaiters().wait(prev_handle.id()).await? {
-                    let block_handle = self.load_block_handle(&id)?;
-                    break Ok((
-                        Arc::clone(&block_handle),
-                        self.load_block(&block_handle).await?
-                    ))
+                if let Some(id) = self.next_block_applying_awaiters().wait(prev_handle.id(), timeout_ms).await? {
+                    if let Some(handle) = self.load_block_handle(&id)? {
+                        let block = self.load_block(&handle).await?;
+                        return Ok((handle, block))
+                    }
                 }
             }
         }
@@ -128,7 +129,9 @@ impl EngineOperations for Engine {
 
     async fn load_last_applied_mc_block(&self) -> Result<BlockStuff> {
         let block_id = &self.load_last_applied_mc_block_id().await?;
-        let handle = self.load_block_handle(&block_id)?;
+        let handle = self.load_block_handle(&block_id)?.ok_or_else(
+            || error!("Cannot load handle for last applied master block {}", block_id)
+        )?;
         self.load_applied_block(&handle).await
     }
 
@@ -153,41 +156,59 @@ impl EngineOperations for Engine {
         ShardsClientMcBlockId(id.into()).store_to_db(self.db().deref())
     }
 
-    async fn apply_block(self: Arc<Self>, handle: &BlockHandle, block: Option<&BlockStuff>, mc_seq_no: u32, pre_apply: bool) -> Result<()> {
+    async fn apply_block(
+        self: Arc<Self>, 
+        handle: &Arc<BlockHandle>, 
+        block: &BlockStuff, 
+        mc_seq_no: u32, 
+        pre_apply: bool
+    ) -> Result<()> {
         // if it is pre-apply we are waiting for `state_inited` or `applied`
         // otherwise - only for applied
-        while !((pre_apply && handle.state_inited()) || handle.applied()) {
-            if let Some(block) = block {
-                if self.block_applying_awaiters().do_or_wait(
-                    handle.id(),
-                    self.clone().apply_block_worker(handle, block, mc_seq_no, pre_apply)
-                ).await?.is_some() {
-                    break;
-                }
-            } else {
-                if self.block_applying_awaiters().do_or_wait(
-                    handle.id(),
-                    self.clone().download_and_apply_block_worker(handle, mc_seq_no, pre_apply)
-                ).await?.is_some() {
-                    break;
-                }
+        while !((pre_apply && handle.has_state()) || handle.is_applied()) {
+            if self.block_applying_awaiters().do_or_wait(
+                handle.id(),
+                None,
+                self.clone().apply_block_worker(handle, block, mc_seq_no, pre_apply)
+            ).await?.is_some() {
+                break;
             }
         }
         Ok(())
     }
 
+    async fn download_and_apply_block(
+        self: Arc<Self>, 
+        id: &BlockIdExt, 
+        mc_seq_no: u32, 
+        pre_apply: bool
+    ) -> Result<()> {
+        self.download_and_apply_block_worker(id, mc_seq_no, pre_apply).await
+    }
+
     async fn download_block(
         &self, 
-        handle: &BlockHandle, 
+        id: &BlockIdExt, 
         limit: Option<u32>
     ) -> Result<(BlockStuff, BlockProofStuff)> {
-        if handle.data_inited() {
-            Ok((
-                self.load_block(handle).await?,
-                self.load_block_proof(handle, !handle.id().shard().is_masterchain()).await?
-            ))
-        } else {
-            self.download_block_worker(handle.id(), limit).await
+        loop {
+            if let Some(handle) = self.load_block_handle(id)? {
+                if handle.has_data() {
+                    let ret = (
+                        self.load_block(&handle).await?,
+                        self.load_block_proof(&handle, !id.shard().is_masterchain()).await?
+                    );
+                    return Ok(ret)
+                }
+            }
+
+            if let Some(data) = self.download_block_awaiters().do_or_wait(
+                id,
+                None,
+                self.download_block_worker(id, limit, None)
+            ).await? {
+                return Ok(data)
+            }
         }
     }
 
@@ -208,22 +229,31 @@ impl EngineOperations for Engine {
         self.download_zerostate_worker(id, None).await
     }
 
-    async fn store_block(&self, handle: &BlockHandle, block: &BlockStuff) -> Result<()> {
-        self.db().store_block_data(handle, block).await?;
+    async fn store_block(&self, block: &BlockStuff) -> Result<Arc<BlockHandle>> {
+        let handle = self.db().store_block_data(block).await?;
         if handle.id().shard().is_masterchain() {
             if handle.is_key_block()? {
                 self.update_last_known_keyblock_seqno(handle.id().seq_no());
             }
             self.update_last_known_mc_block_seqno(handle.id().seq_no());
         }
-        Ok(())
+        Ok(handle)
     }
 
-    async fn store_block_proof(&self, handle: &BlockHandle, proof: &BlockProofStuff) -> Result<()> {
-        self.db().store_block_proof(handle, proof).await
+    async fn store_block_proof(
+        &self, 
+        id: &BlockIdExt,
+        handle: Option<Arc<BlockHandle>>, 
+        proof: &BlockProofStuff
+    ) -> Result<Arc<BlockHandle>> {
+        self.db().store_block_proof(id, handle, proof).await
     }
 
-    async fn load_block_proof(&self, handle: &BlockHandle, is_link: bool) -> Result<BlockProofStuff> {
+    async fn load_block_proof(
+        &self, 
+        handle: &Arc<BlockHandle>, 
+        is_link: bool
+    ) -> Result<BlockProofStuff> {
         // TODO make cache?
         self.db().load_block_proof(handle, is_link).await
     }
@@ -241,7 +271,13 @@ impl EngineOperations for Engine {
     }
 
     async fn load_state(&self, block_id: &BlockIdExt) -> Result<ShardStateStuff> {
-        self.db().load_shard_state_dynamic(block_id)
+        if let Some (kv) = self.shard_states_cache().get(block_id) {
+            Ok(kv.val().clone())
+        } else {
+            let state = self.db().load_shard_state_dynamic(block_id)?;
+            self.shard_states_cache().insert(block_id.clone(), state.clone());
+            Ok(state)
+        }
     }
 
     async fn load_persistent_state_size(&self, block_id: &BlockIdExt) -> Result<u64> {
@@ -257,38 +293,67 @@ impl EngineOperations for Engine {
         self.db().load_shard_state_persistent_slice(handle.id(), offset, length).await
     }
 
-    async fn wait_state(&self, handle: &BlockHandle) -> Result<ShardStateStuff> {
+    async fn wait_state(self: Arc<Self>, id: &BlockIdExt, timeout_ms: Option<u64>) -> Result<ShardStateStuff> {
         loop {
-            if handle.state_inited() {
-                break self.load_state(handle.id()).await
-            } else {
-                if let Some(ss) = self.shard_states_awaiters().wait(handle.id()).await? {
-                    break Ok(ss)
+            if let Some(handle) = self.load_block_handle(id)? {
+                if handle.has_state() {
+                    break self.load_state(id).await
                 }
+            }
+            let id1 = id.clone();
+            let engine = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = engine.download_and_apply_block(&id1, 0, true).await {
+                    log::error!("Error while pre-apply block (while wait_state) {}: {}", id1, e);
+                }
+            });
+            if let Some(ss) = self.shard_states_awaiters().wait(id, timeout_ms).await? {
+                break Ok(ss)
             }
         }
     }
 
-    async fn store_state(&self, handle: &BlockHandle, state: &ShardStateStuff) -> Result<()> {
+    async fn store_state(
+        &self, 
+        handle: &Arc<BlockHandle>, 
+        state: &ShardStateStuff
+    ) -> Result<()> {
         self.shard_states_awaiters().do_or_wait(
             state.block_id(),
+            None,
             async { Ok(state.clone()) }
         ).await?;
+        if self.shard_states_cache().get(handle.id()).is_none() {
+            self.shard_states_cache().insert(handle.id().clone(), state.clone());
+        }
         self.db().store_shard_state_dynamic(handle, state)
     }
-    async fn store_zerostate(&self, handle: &BlockHandle, state: &ShardStateStuff, state_bytes: &[u8]) -> Result<()> {
-        self.store_state(handle, state).await?;
-        self.db().store_shard_state_persistent_raw(handle, state_bytes).await
-    }
-    fn store_block_prev(&self, handle: &BlockHandle, prev: &BlockIdExt) -> Result<()> {
-        self.db().store_block_prev(handle, prev)
+
+    async fn store_zerostate(
+        &self, 
+        id: &BlockIdExt, 
+        state: &ShardStateStuff, 
+        state_bytes: &[u8]
+    ) -> Result<Arc<BlockHandle>> {
+        let handle = self.db().create_or_load_block_handle(
+            id, 
+            None, 
+            Some(state.state().gen_time())
+        )?;
+        self.store_state(&handle, state).await?;
+        self.db().store_shard_state_persistent_raw(&handle, state_bytes).await?;
+        Ok(handle)
     }
 
-    fn load_block_prev(&self, id: &BlockIdExt) -> Result<BlockIdExt> {
-        self.db().load_block_prev(id)
+    fn store_block_prev1(&self, handle: &Arc<BlockHandle>, prev: &BlockIdExt) -> Result<()> {
+        self.db().store_block_prev1(handle, prev)
     }
 
-    fn store_block_prev2(&self, handle: &BlockHandle, prev2: &BlockIdExt) -> Result<()> {
+    fn load_block_prev1(&self, id: &BlockIdExt) -> Result<BlockIdExt> {
+        self.db().load_block_prev1(id)
+    }
+
+    fn store_block_prev2(&self, handle: &Arc<BlockHandle>, prev2: &BlockIdExt) -> Result<()> {
         self.db().store_block_prev2(handle, prev2)
     }
 
@@ -296,7 +361,7 @@ impl EngineOperations for Engine {
         self.db().load_block_prev2(id)
     }
 
-    fn store_block_next1(&self, handle: &BlockHandle, next: &BlockIdExt) -> Result<()> {
+    fn store_block_next1(&self, handle: &Arc<BlockHandle>, next: &BlockIdExt) -> Result<()> {
         self.db().store_block_next1(handle, next)
     }
 
@@ -304,7 +369,7 @@ impl EngineOperations for Engine {
         self.db().load_block_next1(id)
     }
 
-    fn store_block_next2(&self, handle: &BlockHandle, next2: &BlockIdExt) -> Result<()> {
+    fn store_block_next2(&self, handle: &Arc<BlockHandle>, next2: &BlockIdExt) -> Result<()> {
         self.db().store_block_next2(handle, next2)
     }
 
@@ -314,7 +379,7 @@ impl EngineOperations for Engine {
 
     async fn process_block_in_ext_db(
         &self,
-        handle: &BlockHandle,
+        handle: &Arc<BlockHandle>,
         block: &BlockStuff,
         proof: Option<&BlockProofStuff>,
         state: &ShardStateStuff)
@@ -334,7 +399,7 @@ impl EngineOperations for Engine {
                 }
             }
         }
-        self.db().store_block_processed_in_ext_db(handle)?;
+//        self.db().store_block_processed_in_ext_db(handle)?;
         Ok(())
     }
 
@@ -345,30 +410,23 @@ impl EngineOperations for Engine {
         Ok(())
     }
 
-    async fn download_next_key_blocks_ids(&self, block_id: &BlockIdExt, _priority: u32) -> Result<Vec<BlockIdExt>> {
+    async fn download_next_key_blocks_ids(
+        &self, 
+        block_id: &BlockIdExt, 
+        _priority: u32
+    ) -> Result<Vec<BlockIdExt>> {
         let mc_overlay = self.get_masterchain_overlay().await?;
-        mc_overlay.download_next_key_blocks_ids(
-            block_id, 
-            5, 
-            &Attempts {
-//                total_limit: 0,
-                limit: 10,
-                count: 0
-            }
-        ).await
+        mc_overlay.download_next_key_blocks_ids(block_id, 5).await
     }
 
-    async fn set_applied(&self, handle: &BlockHandle, mc_seq_no: u32) -> Result<()> {
-        if handle.applied() {
+    async fn set_applied(&self, handle: &Arc<BlockHandle>, mc_seq_no: u32) -> Result<()> {
+        if handle.is_applied() {
             return Ok(());
         }
-
         self.db().assign_mc_ref_seq_no(handle, mc_seq_no)?;
         self.db().index_handle(handle)?;
-
         self.db().archive_block(handle.id()).await?;
-        self.db().store_block_applied(handle).await?;
-
+        self.db().store_block_applied(handle)?;
         Ok(())
     }
 
@@ -397,16 +455,10 @@ impl EngineOperations for Engine {
 
     async fn download_archive(&self, masterchain_seqno: u32) -> Result<Option<Vec<u8>>> {
         let client = self.get_masterchain_overlay().await?;
-        client.download_archive(
-            masterchain_seqno,
-            &Attempts {
-                limit: 10,
-                count: 0
-            }
-        ).await
+        client.download_archive(masterchain_seqno).await
     }
 
-    fn assign_mc_ref_seq_no(&self, handle: &BlockHandle, mc_seq_no: u32) -> Result<()> {
+    fn assign_mc_ref_seq_no(&self, handle: &Arc<BlockHandle>, mc_seq_no: u32) -> Result<()> {
         self.db().assign_mc_ref_seq_no(handle, mc_seq_no)
     }
 
@@ -418,7 +470,7 @@ impl EngineOperations for Engine {
         overlay.send_block_broadcast(broadcast).await
     }
 
-    async fn send_top_shard_block_description(&self, tbd: TopBlockDescrStuff) -> Result<()> {
+    async fn send_top_shard_block_description(&self, tbd: &TopBlockDescrStuff) -> Result<()> {
         let overlay = self.get_full_node_overlay(
             MASTERCHAIN_ID, //tbd.proof_for().shard().workchain_id(), by t-node all broadcast are sending into masterchain overlay
             SHARD_FULL, //tbd.proof_for().shard().shard_prefix_with_tag()
@@ -472,5 +524,19 @@ impl EngineOperations for Engine {
     // If given mc_seq_no is not equal to last mc seq_no - function fails.
     fn get_shard_blocks(&self, mc_seq_no: u32) -> Result<Vec<Arc<TopBlockDescrStuff>>> {
         self.shard_blocks().get_shard_blocks(mc_seq_no)
+    }
+
+    // Save tsb into persistent storage
+    fn save_top_shard_block(&self, id: &TopBlockDescrId, tsb: &TopBlockDescrStuff) -> Result<()> {
+        self.db().save_top_shard_block(id, tsb)
+    }
+
+    // Remove tsb from persistent storage
+    fn remove_top_shard_block(&self, id: &TopBlockDescrId) -> Result<()> {
+        self.db().remove_top_shard_block(id)
+    }
+    
+    fn test_bundles_config(&self) -> &CollatorTestBundlesGeneralConfig {
+        Engine::test_bundles_config(self)
     }
 }

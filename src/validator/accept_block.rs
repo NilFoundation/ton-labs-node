@@ -15,6 +15,7 @@ use ton_block::{
 };
 use ton_types::{error, Result, fail, UInt256, UsageTree, HashmapType};
 use ton_api::ton::ton_node::{blocksignature::BlockSignature, broadcast::BlockBroadcast};
+use rand::Rng;
 
 #[allow(dead_code)]
 pub async fn accept_block(
@@ -42,9 +43,7 @@ pub async fn accept_block(
         precheck_header(&block, &prev, is_fake, is_fork)?;
         Ok(block)
     }).transpose()?;
-
-    let handle = engine.load_block_handle(&id)?;
-
+                                                                                                                  
     // TODO many checks - if block already applied - finish_query
     // if (handle_->received() && handle_->received_state() && handle_->inited_signatures() &&
     // handle_->inited_split_after() && handle_->inited_merge_before() && handle_->inited_prev() &&
@@ -54,39 +53,44 @@ pub async fn accept_block(
     //     finish_query();
     //     return;
     // }
-    if handle.applied() {
-        log::debug!(target: "validator", "Accept-block: {} is already applied", id);
-        return Ok(())
-    }
 
-    if let Some(block) = block_opt.as_ref() {
-        if !handle.data_inited() {
-            engine.store_block(&handle, block).await?;
+    let handle = if let Some(handle) = engine.load_block_handle(&id)? {
+        if handle.is_applied() {
+            log::debug!(target: "validator", "Accept-block: {} is already applied", id);
+            return Ok(())
         }
-    }
+        if !handle.has_data() {
+            fail!("INTERNAL ERROR: got uninitialized handle for block {}", id)
+        }
+        Some(handle)
+    } else {
+        None
+    }; 
+
+    let block = match block_opt {
+        Some(b) => b,
+        None => {
+            let (block, _proof) = engine.download_block(&id, Some(10)).await?;
+            precheck_header(&block, &prev, is_fake, is_fork)?;
+            block
+        }
+    };
+
+    let mut handle = if let Some(handle) = handle {
+        handle
+    } else {
+        engine.store_block(&block).await?
+    };
 
     // TODO - if signatures is not set - `ValidatorManager::set_block_signatures` ??????
 
     // TODO set merge flag in handle
     // handle_->set_merge(prev_.size() == 2);
 
-    engine.store_block_prev(&handle, &prev[0])?;
+    engine.store_block_prev1(&handle, &prev[0])?;
     if prev.len() == 2 {
         engine.store_block_prev2(&handle, &prev[1])?;
     }
-
-    let block = match block_opt {
-        Some(b) => b,
-        None => {
-            let (block, _proof) = engine.download_block(&handle, Some(10)).await?;
-            precheck_header(&block, &prev, is_fake, is_fork)?;
-            if !handle.data_inited() {
-                engine.store_block(&handle, &block).await?;
-            }
-            block
-        }
-    };
-
 
     let _ss = calc_shard_state(
         &handle,
@@ -95,6 +99,8 @@ pub async fn accept_block(
         &engine
     ).await?;
 
+    let signatures_count = signatures.len();
+
     let (proof, signatures) = create_new_proof(&block, &validator_set, signatures)?;
 
     // handle_->set_state_root_hash(state_hash_);
@@ -102,14 +108,13 @@ pub async fn accept_block(
     // handle_->set_unix_time(created_at_);
     // handle_->set_is_key_block(is_key_block_);
 
-    engine.store_block_proof(&handle, &proof).await?;
-
+    handle = engine.store_block_proof(&id, Some(handle), &proof).await?;
 
     if id.shard().is_masterchain() {
         log::debug!(target: "validator", "Applying block {}", id);
-        engine.clone().apply_block(&handle, Some(&block), id.seq_no(), false).await?;
+        engine.clone().apply_block(&handle, &block, id.seq_no(), false).await?;
     } else {
-        let last_mc_state = choose_mc_state(&block, engine.deref()).await?;
+        let last_mc_state = choose_mc_state(&block, &engine).await?;
 
         if let Some(tbd) = create_top_shard_block_description(
             &block,
@@ -126,7 +131,7 @@ pub async fn accept_block(
             let block_id = block.id().clone();
             tokio::spawn(async move {
                 log::trace!(target: "validator", "accept_block: sending shard block description broadcast {}", block_id);
-                if let Err(e) = engine.send_top_shard_block_description(tbd_stuff).await {
+                if let Err(e) = engine.send_top_shard_block_description(&tbd_stuff).await {
                     log::warn!(
                         target: "validator", 
                         "Accept-block {}: error while sending shard block description broadcast: {}",
@@ -144,6 +149,10 @@ pub async fn accept_block(
         }
     }
 
+    // At least one another node should send block broadcast too
+    let mut rng = rand::thread_rng();
+    let send_block_broadcast = send_block_broadcast || 
+        rng.gen_range(0, 1000) < (1000 / max(1, signatures_count - 1));
 
     if send_block_broadcast {
         let broadcast = build_block_broadcast(&block, validator_set, signatures, proof)?;
@@ -169,7 +178,7 @@ pub async fn accept_block(
 
 async fn choose_mc_state(
     block: &BlockStuff,
-    engine: &dyn EngineOperations
+    engine: &Arc<dyn EngineOperations>
 ) -> Result<ShardStateStuff> {
     let mc_block_id = block.construct_master_id()?;
     let mut last_mc_state = engine.load_last_applied_mc_state().await?;
@@ -182,7 +191,7 @@ async fn choose_mc_state(
             block.id(),
             mc_block_id
         );
-        let new_mc_state = engine.wait_state(engine.load_block_handle(&mc_block_id)?.deref()).await?;
+        let new_mc_state = engine.clone().wait_state(&mc_block_id, Some(60_000)).await?;
         new_mc_state
             .shard_state_extra()?
             .prev_blocks
@@ -208,7 +217,6 @@ async fn choose_mc_state(
                 mc_block_id,
                 last_mc_state.block_id()
             ))?;
-
     } else if *last_mc_state.block_id() != mc_block_id {
         fail!(
             "shardchain block {} refers to masterchain block {} distinct from last \
@@ -272,7 +280,7 @@ fn precheck_header(
     Ok(())
 }
 
-fn create_new_proof(
+pub fn create_new_proof(
     block_stuff: &BlockStuff,
     validator_set: &ValidatorSet,
     signatures: Vec<CryptoSignaturePair>
@@ -505,7 +513,9 @@ async fn build_proof_chain(
     mc_state: &ShardStateStuff
 ) -> Result<Vec<BlockProofStuff>> {
 
-    let handle = engine.load_block_handle(block.id())?;
+    let handle = engine.load_block_handle(block.id())?.ok_or_else(
+        || error!("Cannot load handle for block {}", block.id())
+    )?;
     let mut proof_links = vec![engine.load_block_proof(&handle, true).await?];
     let mut mc_block_id = block.construct_master_id()?;
     let mut link_prev = prev.clone();
@@ -537,7 +547,9 @@ async fn build_proof_chain(
             }
         }
 
-        let prev_handle = engine.load_block_handle(&link_prev[0])?;
+        let prev_handle = engine.load_block_handle(&link_prev[0])?.ok_or_else(
+            || error!("Cannot load handle for prev block {}", link_prev[0])
+        )?;
         let proof_link = match engine.load_block_proof(&prev_handle, true).await {
             Ok(proof_link) => proof_link,
             Err(_) => break

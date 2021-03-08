@@ -784,14 +784,6 @@ impl ReceiverListener for DummyListener {
 
     fn on_blame(&mut self, _receiver: &mut dyn Receiver, _source_id: usize) {}
 
-    fn on_custom_message(
-        &mut self,
-        _receiver: &mut dyn Receiver,
-        _source_public_key_hash: &PublicKeyHash,
-        _data: &BlockPayloadPtr,
-    ) {
-    }
-
     fn on_custom_query(
         &mut self,
         _receiver: &mut dyn Receiver,
@@ -1263,15 +1255,28 @@ impl ReceiverImpl {
 
         trace!("...reading DB from block {:?}", id);
 
+        let listener = self.listener.upgrade().unwrap();
+        let listener = listener.borrow();
+        let task_queue = listener.get_task_queue();
+        let task_queue_clone = task_queue.clone();
+
         self.pending_in_db = 1;
         self.db_root_block = id.clone();
 
         let block_raw_data = self.db.as_ref().unwrap().get_block(id).unwrap();
+        let id = id.clone();
 
-        self.read_block_from_db(id, block_raw_data);
+        task_queue.post_closure(Box::new(move |receiver| {
+            get_mut_impl(receiver).read_block_from_db(&id, block_raw_data, task_queue_clone);
+        }));
     }
 
-    fn read_block_from_db(&mut self, id: &BlockHash, raw_data: RawBuffer) {
+    fn read_block_from_db(
+        &mut self,
+        id: &BlockHash,
+        raw_data: RawBuffer,
+        task_queue: ReceiverTaskQueuePtr,
+    ) {
         instrument!();
 
         trace!("...reading block {:?} from DB", id);
@@ -1379,10 +1384,14 @@ impl ReceiverImpl {
             self.pending_in_db += 1;
 
             let dep_block = self.db.as_ref().unwrap().get_block(dep).unwrap();
+            let dep = dep.clone();
+            let task_queue_clone = task_queue.clone();
 
             //do recursion for block parsing
 
-            self.read_block_from_db(dep, dep_block);
+            task_queue.post_closure(Box::new(move |receiver| {
+                get_mut_impl(receiver).read_block_from_db(&dep, dep_block, task_queue_clone);
+            }));
         }
 
         //deliver blocks when all dependencies are requested from DB
@@ -2032,9 +2041,13 @@ impl ReceiverImpl {
 
         if fork_proof.left.height != fork_proof.right.height
             || fork_proof.left.src != fork_proof.right.src
-            || fork_proof.left.data_hash != fork_proof.right.data_hash
+            || fork_proof.left.data_hash == fork_proof.right.data_hash
         {
-            warn!("Incorrect fork blame, not a fork");
+            warn!("Incorrect fork blame, not a fork: {}/{}, {}/{}, {:?}/{:?}",
+                fork_proof.left.height, fork_proof.right.height,
+                fork_proof.left.src, fork_proof.right.src,
+                fork_proof.left.data_hash, fork_proof.right.data_hash
+            );
             return;
         }
 
@@ -2103,22 +2116,6 @@ impl ReceiverImpl {
         check_execution_time!(5000);
         if let Some(listener) = self.listener.upgrade() {
             listener.borrow_mut().on_blame(self, source_id);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn notify_on_custom_message(
-        &mut self,
-        source_public_key_hash: &PublicKeyHash,
-        data: &BlockPayloadPtr,
-    ) {
-        check_execution_time!(5000);
-        instrument!();
-
-        if let Some(listener) = self.listener.upgrade() {
-            listener
-                .borrow_mut()
-                .on_custom_message(self, source_public_key_hash, data);
         }
     }
 

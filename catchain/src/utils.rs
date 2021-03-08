@@ -299,10 +299,12 @@ pub fn deserialize_tl_boxed_object<T: ::ton_api::BoxedDeserialize>(bytes: &RawBu
    metrics
 */
 
+#[derive(Copy, Clone)]
 enum MetricUsage {
     Counter,
     Derivative,
     Percents,
+    Float,
 }
 
 pub struct Metric {
@@ -320,7 +322,7 @@ pub struct MetricsDumper {
 
 impl MetricsDumper {
     pub const METRIC_DERIVATIVE_MULTIPLIER: f64 = 1000000.0;
-    pub const METRIC_PERCENT_MULTIPLIER: f64 = 10000.0;
+    pub const METRIC_FLOAT_MULTIPLIER: f64 = 10000.0;
 
     pub fn add_compute_handler<F>(&mut self, key: String, handler: F)
     where
@@ -412,7 +414,11 @@ impl MetricsDumper {
                 }
                 Percents => format!(
                     "{:.1}%",
-                    (metric.value as f64) / Self::METRIC_PERCENT_MULTIPLIER * 100.0
+                    (metric.value as f64) / Self::METRIC_FLOAT_MULTIPLIER * 100.0
+                ),
+                Float => format!(
+                    "{:.2}",
+                    (metric.value as f64) / Self::METRIC_FLOAT_MULTIPLIER
                 ),
             };
 
@@ -460,17 +466,23 @@ fn get_metrics_counters_pair(
     Some((value1.value, value2.value))
 }
 
-pub fn compute_instance_counter(
+pub fn compute_diff_counter(
     basic_key: &String,
     metrics: &BTreeMap<String, Metric>,
+    add_suffix: &str,
+    sub_suffix: &str,
 ) -> Option<Metric> {
-    let create_key = basic_key.clone() + ".create";
-    let drop_key = basic_key.clone() + ".drop";
+    let create_key = basic_key.clone() + add_suffix;
+    let drop_key = basic_key.clone() + sub_suffix;
 
     if let Some((create_value, drop_value)) =
         get_metrics_counters_pair(metrics, &create_key, &drop_key)
     {
-        let instance_count = create_value - drop_value;
+        let instance_count = if create_value > drop_value {
+            create_value - drop_value
+        } else {
+            0
+        };
 
         return Some(Metric {
             value: instance_count,
@@ -484,11 +496,61 @@ pub fn compute_instance_counter(
     })
 }
 
+pub fn compute_instance_counter(
+    basic_key: &String,
+    metrics: &BTreeMap<String, Metric>,
+) -> Option<Metric> {
+    compute_diff_counter(basic_key, metrics, ".create", ".drop")
+}
+
+pub fn compute_queue_size_counter(
+    basic_key: &String,
+    metrics: &BTreeMap<String, Metric>,
+) -> Option<Metric> {
+    compute_diff_counter(basic_key, metrics, ".posts", ".pulls")
+}
+
 pub fn add_compute_percentage_metric(
     metrics_dumper: &mut MetricsDumper,
     key: &String,
     value_key: &String,
     total_key: &String,
+    bias: f64,
+) {
+    add_compute_relative_metric_impl(
+        metrics_dumper,
+        key,
+        value_key,
+        total_key,
+        bias,
+        MetricUsage::Percents,
+    );
+}
+
+pub fn add_compute_relative_metric(
+    metrics_dumper: &mut MetricsDumper,
+    key: &String,
+    value_key: &String,
+    total_key: &String,
+    bias: f64,
+) {
+    add_compute_relative_metric_impl(
+        metrics_dumper,
+        key,
+        value_key,
+        total_key,
+        bias,
+        MetricUsage::Float,
+    );
+}
+
+fn add_compute_relative_metric_impl(
+    metrics_dumper: &mut MetricsDumper,
+    key: &String,
+    value_key: &String,
+    total_key: &String,
+    bias: f64,
+    usage: MetricUsage,
 ) {
     let value_key = value_key.clone();
     let total_key = total_key.clone();
@@ -496,12 +558,14 @@ pub fn add_compute_percentage_metric(
         if let Some((value, total_value)) =
             get_metrics_counters_pair(metrics, &value_key, &total_key)
         {
-            let percentage = (value as f64) / (total_value as f64);
+            if total_value != 0 {
+                let percentage = (value as f64) / (total_value as f64) + bias;
 
-            return Some(Metric {
-                value: (percentage * MetricsDumper::METRIC_PERCENT_MULTIPLIER) as u64,
-                usage: MetricUsage::Percents,
-            });
+                return Some(Metric {
+                    value: (percentage * MetricsDumper::METRIC_FLOAT_MULTIPLIER) as u64,
+                    usage: usage,
+                });
+            }
         }
 
         None
@@ -541,7 +605,7 @@ pub fn compute_result_status_metric(
         let percentage = (value as f64) / (total_value as f64);
 
         return Some(Metric {
-            value: (percentage * MetricsDumper::METRIC_PERCENT_MULTIPLIER) as u64,
+            value: (percentage * MetricsDumper::METRIC_FLOAT_MULTIPLIER) as u64,
             usage: MetricUsage::Percents,
         });
     }
@@ -587,7 +651,7 @@ pub fn compute_result_ignore_metric(
     let percentage = (total_value - reports_count as f64) / (total_value as f64);
 
     Some(Metric {
-        value: (percentage * MetricsDumper::METRIC_PERCENT_MULTIPLIER) as u64,
+        value: (percentage * MetricsDumper::METRIC_FLOAT_MULTIPLIER) as u64,
         usage: MetricUsage::Percents,
     })
 }

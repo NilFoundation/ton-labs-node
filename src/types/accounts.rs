@@ -1,4 +1,4 @@
-use std::{sync::{Arc, atomic::AtomicU64}};
+use std::sync::{Arc, atomic::AtomicU64};
 use ton_block::{
     Serializable, ShardAccount, ShardAccounts,
     AccountBlock, Transaction, Transactions, HashUpdate, LibDescr,
@@ -16,14 +16,14 @@ pub struct ShardAccountStuff {
 }
 
 impl ShardAccountStuff {
-    pub fn from_shard_state(account_addr: AccountId, accounts: &ShardAccounts, block_lt: u64) -> Result<Self> {
+    pub fn from_shard_state(account_addr: AccountId, accounts: &ShardAccounts, lt: Arc<AtomicU64>) -> Result<Self> {
         let shard_acc = accounts.account(&account_addr)?.unwrap_or_default();
         let account_hash = shard_acc.account_cell().repr_hash();
         Ok(Self{
             account_addr,
             orig_libs: shard_acc.read_account()?.libraries(),
             shard_acc,
-            lt: Arc::new(AtomicU64::new(block_lt)),
+            lt,
             transactions: Default::default(),
             state_update: HashUpdate::with_hashes(account_hash.clone(), account_hash),
         })
@@ -41,8 +41,8 @@ impl ShardAccountStuff {
     pub fn lt(&self) -> Arc<AtomicU64> {
         self.lt.clone()
     }
-    pub fn account_cell(&self) -> &Cell {
-        self.shard_acc.account_cell()
+    pub fn account_cell(&self) -> Cell {
+        self.shard_acc.account_cell().clone()
     }
     pub fn shard_account(&self) -> &ShardAccount {
         &self.shard_acc
@@ -70,9 +70,10 @@ impl ShardAccountStuff {
 
         Ok(())
     }
-    pub fn serialize(&self) -> Result<Cell> {
-        self.shard_acc.serialize()
-    }
+// Unused
+//    pub fn serialize(&self) -> Result<Cell> {
+//        self.shard_acc.serialize()
+//    }
     pub fn update_public_libraries(&self, libraries: &mut Libraries) -> Result<()> {
         let new_libs = self.shard_acc.read_account()?.libraries();
         if new_libs.root() != self.orig_libs.root() {

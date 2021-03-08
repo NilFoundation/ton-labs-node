@@ -126,6 +126,7 @@ impl MessagesPool {
         self.new_message(id, message, now)
     }
 
+
     pub fn new_message(&self, id: UInt256, message: Arc<Message>, now: u32) -> Result<()> {
         self.messages.insert_with(id, |_key, prev_gen_val, updated_pair | {
             if updated_pair.is_some() {
@@ -178,6 +179,8 @@ impl MessagesPool {
         }
         Ok(())
     }
+
+
 }
 
 pub fn create_ext_message(data: &[u8]) -> Result<(UInt256, Message)> {

@@ -1,9 +1,8 @@
 use crate::{
-    define_db_prop,
+    define_db_prop, 
     block::{convert_block_id_ext_api2blk, BlockStuff, BlockIdExtExtention},
     block_proof::BlockProofStuff,
-    config::{TonNodeConfig, KafkaConsumerConfig},
-    db::{BlockHandle, InternalDb, InternalDbConfig, InternalDbImpl, NodeState},
+    config::{TonNodeConfig, KafkaConsumerConfig, CollatorTestBundlesGeneralConfig},
     engine_traits::{ExternalDb, OverlayOperations, EngineOperations, PrivateOverlayOperations},
     full_node::{
         apply_block::apply_block,
@@ -11,46 +10,42 @@ use crate::{
             process_block_broadcast, start_masterchain_client, start_shards_client
         },
     },
+    internal_db::{InternalDb, InternalDbConfig, InternalDbImpl, NodeState},
     network::{
-        full_node_client::{Attempts, FullNodeOverlayClient},
+        full_node_client::FullNodeOverlayClient, control::ControlServer,
         full_node_service::FullNodeOverlayService
     },
     shard_state::ShardStateStuff,
     types::awaiters_pool::AwaitersPool,
     ext_messages::MessagesPool,
     validator::validator_manager,
-    shard_blocks::ShardBlocksPool,
+    shard_blocks::{ShardBlocksPool, resend_top_shard_blocks_worker, save_top_shard_blocks_worker},
 };
 #[cfg(feature = "local_test")]
 use crate::network::node_network_stub::NodeNetworkStub;
 #[cfg(not(feature = "local_test"))]
 use crate::network::node_network::NodeNetwork;
-
 #[cfg(feature = "external_db")]
 use crate::external_db::kafka_consumer::KafkaConsumer;
 
+use overlay::QueriesConsumer;
 #[cfg(feature = "metrics")]
 use statsd::client;
+use std::{
+    convert::TryInto, ops::Deref, sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}},
+    time::Duration, mem::ManuallyDrop, collections::HashMap,
+};
 #[cfg(feature = "metrics")]
 use std::env;
-
-use overlay::QueriesConsumer;
-use std::{
-    sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}},
-    ops::Deref,
-    time::Duration,
-    convert::TryInto
-};
-
+use storage::types::BlockHandle;
 use ton_block::{
     self, ShardIdent, BlockIdExt, MASTERCHAIN_ID, SHARD_FULL, BASE_WORKCHAIN_ID, ShardDescr
 };
 use ton_types::{error, Result, fail};
-use tokio::{time::delay_for, task::JoinHandle};
-use lazy_static;
 use ton_api::ton::ton_node::{
     Broadcast, broadcast::{BlockBroadcast, ExternalMessageBroadcast, NewShardBlockBroadcast}
 };
+use adnl::server::AdnlServerConfig;
 
 define_db_prop!(LastMcBlockId,   "LastMcBlockId",   ton_api::ton::ton_node::blockidext::BlockIdExt);
 define_db_prop!(InitMcBlockId,   "InitMcBlockId",   ton_api::ton::ton_node::blockidext::BlockIdExt);
@@ -68,7 +63,7 @@ pub struct Engine {
     shard_states_awaiters: AwaitersPool<BlockIdExt, ShardStateStuff>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
     next_block_applying_awaiters: AwaitersPool<BlockIdExt, BlockIdExt>,
-    download_block_awaiters: AwaitersPool<BlockIdExt, BlockStuff>,
+    download_block_awaiters: AwaitersPool<BlockIdExt, (BlockStuff, BlockProofStuff)>,
     external_messages: MessagesPool,
 
     zero_state_id: BlockIdExt,
@@ -81,49 +76,54 @@ pub struct Engine {
     last_known_mc_block_seqno: AtomicU32,
     last_known_keyblock_seqno: AtomicU32,
     will_validate: AtomicBool,
+
+    test_bundles_config: CollatorTestBundlesGeneralConfig,
+ 
+    shard_states_cache: lockfree::map::Map<BlockIdExt, ShardStateStuff>,
 }
 
 struct DownloadContext<'a, T> {
-    attempts: Attempts,
     client: Arc<dyn FullNodeOverlayClient>,
+    db: &'a dyn InternalDb,
     downloader: Arc<dyn Downloader<Item = T>>,
     id: &'a BlockIdExt,
     limit: Option<u32>, 
     name: &'a str,
-    timeout: Option<(u64, u64)> // (current, max)
+    timeout: Option<(u64, u64, u64)> // (current, multiplier*10, max)
 }
 
 impl <T> DownloadContext<'_, T> {
 
     async fn download(&mut self) -> Result<T> {
+        let mut attempt = 0;
         loop {
             match self.downloader.try_download(self).await {
-                Err(e) => self.log(format!("{}", e).as_str()),
-                Ok(None) => self.log("got no_data"),
+                Err(e) => self.log(format!("{}", e).as_str(), attempt),
+                Ok(None) => self.log("got no_data", attempt),
                 Ok(Some(ret)) => break Ok(ret)
             }
-            self.attempts.count += 1;
+            attempt += 1;
             if let Some(limit) = &self.limit {
-                if &self.attempts.count > limit {
+                if &attempt > limit {
                     fail!("Downloader: out of attempts");
                 }
             }
-            if let Some((current, max)) = &mut self.timeout {
-                *current = (*max).max(*current * 11) / 10;
+            if let Some((current, mult, max)) = &mut self.timeout {
+                *current = (*max).min(*current * *mult / 10);
                 futures_timer::Delay::new(Duration::from_millis(*current)).await;
             }
         }
     }
 
-    fn log(&self, msg: &str) {
+    fn log(&self, msg: &str, attempt: u32) {
        log::log!(
-           if self.attempts.count > 10 {
+           if attempt > 10 {
                log::Level::Warn
            } else {
                log::Level::Debug
            },
            "{} (attempt {}): id: {}, {}",
-           self.name, self.attempts.count, self.id, msg
+           self.name, attempt, self.id, msg
        )
     }
 
@@ -134,7 +134,7 @@ trait Downloader: Send + Sync {
     type Item;
     async fn try_download(
         &self, 
-        context: &DownloadContext<'_, Self::Item>
+        context: &DownloadContext<'_, Self::Item>,
     ) -> Result<Option<Self::Item>>;
 }
 
@@ -145,11 +145,20 @@ impl Downloader for BlockDownloader {
     type Item = (BlockStuff, BlockProofStuff);
     async fn try_download(
         &self, 
-        context: &DownloadContext<'_, Self::Item>
+        context: &DownloadContext<'_, Self::Item>,
     ) -> Result<Option<Self::Item>> {
-        context.client.download_block_full(context.id, &context.attempts).await        
+        if let Some(handle) = context.db.load_block_handle(context.id)? {
+            let mut is_link = false;
+            if handle.has_data() && handle.has_proof_or_link(&mut is_link) {
+                return Ok(Some((
+                    context.db.load_block_data(&handle).await?,
+                    context.db.load_block_proof(&handle, is_link).await?
+                )));
+            }
+        }
+        context.client.download_block_full(context.id).await
     }
-}              
+}
 
 struct BlockProofDownloader {
     is_link: bool,
@@ -161,13 +170,18 @@ impl Downloader for BlockProofDownloader {
     type Item = BlockProofStuff;
     async fn try_download(
         &self, 
-        context: &DownloadContext<'_, Self::Item>
+        context: &DownloadContext<'_, Self::Item>,
     ) -> Result<Option<Self::Item>> {
+        if let Some(handle) = context.db.load_block_handle(context.id)? {
+            let mut is_link = false;
+            if handle.has_proof_or_link(&mut is_link) {
+                return Ok(Some(context.db.load_block_proof(&handle, is_link).await?));
+            }
+        }
         context.client.download_block_proof(
             context.id, 
             self.is_link, 
             self.key_block, 
-            &context.attempts
         ).await        
     }
 }              
@@ -179,9 +193,23 @@ impl Downloader for NextBlockDownloader {
     type Item = (BlockStuff, BlockProofStuff);
     async fn try_download(
         &self, 
-        context: &DownloadContext<'_, Self::Item>
+        context: &DownloadContext<'_, Self::Item>,
     ) -> Result<Option<Self::Item>> {
-        context.client.download_next_block_full(context.id, &context.attempts).await        
+        if let Some(prev_handle) = context.db.load_block_handle(context.id)? {
+            if prev_handle.has_next1() {
+                let next_id = context.db.load_block_next1(context.id)?;
+                if let Some(next_handle) = context.db.load_block_handle(&next_id)? {
+                    let mut is_link = false;
+                    if next_handle.has_data() && next_handle.has_proof_or_link(&mut is_link) {
+                        return Ok(Some((
+                            context.db.load_block_data(&next_handle).await?,
+                            context.db.load_block_proof(&next_handle, is_link).await?
+                        )));
+                    }
+                }
+            }
+        }
+        context.client.download_next_block_full(context.id).await
     }    
 }  
 
@@ -192,20 +220,31 @@ impl Downloader for ZeroStateDownloader {
     type Item = (ShardStateStuff, Vec<u8>);
     async fn try_download(
         &self, 
-        context: &DownloadContext<'_, Self::Item>
+        context: &DownloadContext<'_, Self::Item>,
     ) -> Result<Option<Self::Item>> {
-        context.client.download_zero_state(context.id, &context.attempts).await
+        if let Some(handle) = context.db.load_block_handle(context.id)? {
+            if handle.has_state() {
+                let zs = context.db.load_shard_state_dynamic(context.id)?;
+                let mut data = vec!();
+                zs.write_to(&mut data)?;
+                return Ok(Some((zs, data)));
+            }
+        }
+        context.client.download_zero_state(context.id).await
     }
 }
 
 impl Engine {
-    pub async fn new(general_config: TonNodeConfig, ext_db: Vec<Arc<dyn ExternalDb>>) -> Result<Arc<Self>> {
+
+    pub async fn new(general_config: TonNodeConfig, ext_db: Vec<Arc<dyn ExternalDb>>, initial_sync_disabled : bool) -> Result<Arc<Self>> {
+
          log::info!("Creating engine...");
 
         let db_directory = general_config.internal_db_path().unwrap_or_else(|| {"node_db"});
         let db_config = InternalDbConfig { db_directory: db_directory.to_string() };
         let db = Arc::new(InternalDbImpl::new(db_config).await?);
         let global_config = general_config.load_global_config()?;
+        let test_bundles_config = general_config.test_bundles_config().clone();
         let zero_state_id = global_config.zero_state().expect("check zero state settings");
         let mut init_mc_block_id = global_config.init_block()?.unwrap_or_else(|| zero_state_id.clone());
         if let Ok(block_id) = InitMcBlockId::load_from_db(db.deref()) {
@@ -213,7 +252,6 @@ impl Engine {
                 init_mc_block_id = convert_block_id_ext_api2blk(&block_id.0)?;
             }
         }
-        let initial_sync_disabled = false;
 
         #[cfg(feature = "local_test")]
         let network = {
@@ -222,8 +260,20 @@ impl Engine {
             Arc::new(NodeNetworkStub::new(&general_config, db.clone(), path)?)
         };
         #[cfg(not(feature = "local_test"))]
-        let network = Arc::new(NodeNetwork::new(general_config, db.clone()).await?);
+        let network = Arc::new(NodeNetwork::new(general_config).await?);
         network.clone().start().await?;
+
+        let shard_blocks = match db.load_all_top_shard_blocks() {
+            Ok(tsbs) => tsbs,
+            Err(e) => {
+                log::error!("Can't load top shard blocks from db (continue without ones): {:?}", e);
+                HashMap::default()
+            }
+        };
+        let last_mc_seqno = LastMcBlockId::load_from_db(db.deref())
+            .map(|id| id.0.seqno as u32).unwrap_or_default();
+        let (shard_blocks_pool, shard_blocks_receiver) = 
+            ShardBlocksPool::new(shard_blocks, last_mc_seqno, false);
 
         log::info!("Engine is created.");
 
@@ -231,10 +281,10 @@ impl Engine {
             db,
             ext_db,
             overlay_operations: network.clone(),
-            shard_states_awaiters: AwaitersPool::new(),
-            block_applying_awaiters: AwaitersPool::new(),
-            next_block_applying_awaiters: AwaitersPool::new(),
-            download_block_awaiters: AwaitersPool::new(),
+            shard_states_awaiters: AwaitersPool::new("shard_states_awaiters"),
+            block_applying_awaiters: AwaitersPool::new("block_applying_awaiters"),
+            next_block_applying_awaiters: AwaitersPool::new("next_block_applying_awaiters"),
+            download_block_awaiters: AwaitersPool::new("download_block_awaiters"),
             external_messages: MessagesPool::new(),
             zero_state_id,
             init_mc_block_id,
@@ -242,23 +292,15 @@ impl Engine {
             network: network.clone(),
             aux_mc_shard_states: Default::default(),
             shard_states: Default::default(),
-            shard_blocks: ShardBlocksPool::new(),
+            shard_blocks: shard_blocks_pool,
             last_known_mc_block_seqno: AtomicU32::new(0),
             last_known_keyblock_seqno: AtomicU32::new(0),
             will_validate: AtomicBool::new(false),
+            test_bundles_config,
+            shard_states_cache: Default::default(),
         });
 
-        let full_node_service: Arc<dyn QueriesConsumer> = Arc::new(
-            FullNodeOverlayService::new(Arc::clone(&engine) as Arc<dyn EngineOperations>)
-        );
-        network.add_consumer(
-            &network.calc_overlay_id(MASTERCHAIN_ID, SHARD_FULL)?.0,
-            Arc::clone(&full_node_service)
-        )?;
-        network.add_consumer(
-            &network.calc_overlay_id(BASE_WORKCHAIN_ID, SHARD_FULL)?.0,
-            Arc::clone(&full_node_service)
-        )?;
+        save_top_shard_blocks_worker(engine.clone(), shard_blocks_receiver);
 
         engine.get_full_node_overlay(BASE_WORKCHAIN_ID, SHARD_FULL).await?;
 
@@ -268,6 +310,8 @@ impl Engine {
     pub fn db(&self) -> &Arc<dyn InternalDb> { &self.db }
 
     pub fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> { self.network.clone() }
+    
+    pub fn network(&self) -> &NodeNetwork { &self.network }
 
     pub fn ext_db(&self) -> &Vec<Arc<dyn ExternalDb>> { &self.ext_db }
 
@@ -283,6 +327,10 @@ impl Engine {
 
     pub fn shard_states(&self) -> &lockfree::map::Map<ShardIdent, ShardStateStuff> {
         &self.shard_states
+    }
+
+    pub fn shard_states_cache(&self) -> &lockfree::map::Map<BlockIdExt, ShardStateStuff> {
+        &self.shard_states_cache
     }
 
     pub fn set_init_mc_block_id(&self, init_mc_block_id: &BlockIdExt) {
@@ -312,7 +360,7 @@ impl Engine {
         &self.next_block_applying_awaiters
     }
 
-    pub fn download_block_awaiters(&self) -> &AwaitersPool<BlockIdExt, BlockStuff> {
+    pub fn download_block_awaiters(&self) -> &AwaitersPool<BlockIdExt, (BlockStuff, BlockProofStuff)> {
         &self.download_block_awaiters
     }
 
@@ -340,62 +388,80 @@ impl Engine {
         self.last_known_keyblock_seqno.fetch_max(seqno, Ordering::SeqCst) < seqno
     }
 
-    pub async fn download_and_apply_block_worker(self: Arc<Self>, handle: &BlockHandle, mc_seq_no: u32, pre_apply: bool) -> Result<()> {
+    pub fn test_bundles_config(&self) -> &CollatorTestBundlesGeneralConfig {
+        &self.test_bundles_config
+    }
 
-        if handle.applied() || pre_apply && handle.state_inited() {
-            log::trace!(
-                "download_and_apply_block_worker(pre_apply: {}): block is already applied {}",
-                pre_apply,
-                handle.id()
-            );
-            return Ok(());
-        }
+    pub async fn download_and_apply_block_worker(
+        self: Arc<Self>, 
+        id: &BlockIdExt, 
+        mc_seq_no: u32, 
+        pre_apply: bool
+    ) -> Result<()> {
 
-        let block = if handle.data_inited() {
-            self.load_block(handle).await?
-        } else {
+        loop {
+            if let Some(handle) = self.load_block_handle(id)? {
+                if handle.is_applied() || pre_apply && handle.has_state() {
+                    log::trace!(
+                        "download_and_apply_block_worker(pre_apply: {}): block is already applied {}",
+                        pre_apply,
+                        handle.id()
+                    );
+                    return Ok(());
+                }
+                if handle.has_data() {
+                    let block = self.load_block(&handle).await?;
+                    self.apply_block_worker(&handle, &block, mc_seq_no, pre_apply).await?;
+                    return Ok(());
+                }
+            } 
+
             let now = std::time::Instant::now();
             log::trace!(
                 "Start downloading block for {}apply... {}",
                 if pre_apply { "pre-" } else { "" },
-                handle.id()
+                id
             );
-
             // for pre-apply only 10 attempts, for apply - infinity
-            let attempts = if pre_apply { 
-                Some(10) 
+            let (attempts, timeout) = if pre_apply { 
+                (Some(30), Some((10, 15, 100)))
             } else { 
-                None
+                (None, None)
             };
-            let (block, proof) = self.download_block_worker(handle.id(), attempts).await?;
-            let downloading_time = now.elapsed().as_millis();
-            let now = std::time::Instant::now();
-            proof.check_proof(self.deref()).await?;
-            self.store_block_proof(handle, &proof).await?;
-            self.store_block(handle, &block).await?;
 
-            log::trace!("Downloaded block for {}apply {} TIME download: {}ms, check & save: {}", 
-                if pre_apply { "pre-" } else { "" }, 
-                block.id(),
-                downloading_time, 
-                now.elapsed().as_millis(),
-            );
-            block
-        };
+            if let Some((block, proof)) = self.download_block_awaiters().do_or_wait(
+                id,
+                None,
+                self.download_block_worker(id, attempts, timeout)
+            ).await? {
+                let downloading_time = now.elapsed().as_millis();
 
-        self.apply_block_worker(handle, &block, mc_seq_no, pre_apply).await?;
+                let now = std::time::Instant::now();
+                proof.check_proof(self.deref()).await?;
+                let handle = self.store_block(&block).await?;
+                let handle = self.store_block_proof(id, Some(handle), &proof).await?;
 
-        Ok(())
+                log::trace!(
+                    "Downloaded block for {}apply {} TIME download: {}ms, check & save: {}", 
+                    if pre_apply { "pre-" } else { "" }, 
+                    block.id(),
+                    downloading_time, 
+                    now.elapsed().as_millis(),
+                );
+                self.apply_block(&handle, &block, mc_seq_no, pre_apply).await?;
+                return Ok(())
+            }
+        }
     }
 
     pub async fn apply_block_worker(
         self: Arc<Self>,
-        handle: &BlockHandle,
+        handle: &Arc<BlockHandle>,
         block: &BlockStuff,
         mc_seq_no: u32,
         pre_apply: bool,
     ) -> Result<()> {
-        if handle.applied() || pre_apply && handle.state_inited() {
+        if handle.is_applied() || pre_apply && handle.has_state() {
             log::trace!(
                 "apply_block_worker(pre_apply: {}): block is already applied {}",
                 pre_apply,
@@ -419,7 +485,7 @@ impl Engine {
             if !pre_apply {
                 self.store_last_applied_mc_block_id(block.id()).await?;
                 STATSD.gauge("last_applied_mc_block", block.id().seq_no() as f64);
-
+                STATSD.gauge("timediff", ago as f64);
                 self.shard_blocks().update_shard_blocks(&self.load_state(block.id()).await?)?;
 
                 let (prev_id, prev2_id_opt) = block.construct_prev_id()?;
@@ -427,7 +493,7 @@ impl Engine {
                     fail!("UNEXPECTED error: master block refers two previous blocks");
                 }
                 let id = handle.id().clone();
-                self.next_block_applying_awaiters.do_or_wait(&prev_id, async move { Ok(id) }).await?;
+                self.next_block_applying_awaiters.do_or_wait(&prev_id, None, async move { Ok(id) }).await?;
             }
 
             log::info!(
@@ -524,13 +590,15 @@ impl Engine {
         }
     }
 
-    async fn process_new_shard_block(self: Arc<Self>, broadcast: Box<NewShardBlockBroadcast>) -> Result<()> {
+    async fn process_new_shard_block(
+        self: Arc<Self>, 
+        broadcast: Box<NewShardBlockBroadcast>
+    ) -> Result<()> {
         let id = (&broadcast.block.block).try_into()?;
         let cc_seqno = broadcast.block.cc_seqno as u32;
         let data = broadcast.block.data.0;
         if self.shard_blocks.add_shard_block(&id, cc_seqno, data, self.deref()).await? {
-            let handle = self.load_block_handle(&id)?;
-            self.apply_block(handle.deref(), None, 0, true).await?;
+            self.download_and_apply_block(&id, 0, true).await?;
         }
         Ok(())              
     }                  
@@ -541,17 +609,14 @@ impl Engine {
          id: &'a BlockIdExt, 
          limit: Option<u32>,
          name: &'a str,
-         timeout: Option<(u64, u64)>
+         timeout: Option<(u64, u64, u64)>
     ) -> Result<DownloadContext<'a, T>> {
         let ret = DownloadContext {
-            attempts: Attempts {
-                limit: 3,
-                count: 0
-            },
             client: self.get_full_node_overlay(
                 id.shard().workchain_id(),
                 id.shard().shard_prefix_with_tag()
             ).await?,
+            db: self.db.deref(),
             downloader,
             id,
             limit,
@@ -574,87 +639,23 @@ impl Engine {
             prev_id, 
             limit, 
             "download_next_block_worker", 
-            Some((50, 1000))
+            Some((50, 11, 1000))
         ).await?.download().await
-/*
-        let client = self.get_full_node_overlay(
-            prev_id.shard().workchain_id(),
-            prev_id.shard().shard_prefix_with_tag()
-        ).await?;
-        let mut attempts = Attempts {
-            total_limit: limit,
-            limit: 3,
-            count: 0
-        };
-        let mut timeout = 50.0;
-        loop {
-            match client.download_next_block_full(&prev_id, &attempts).await {
-                Err(e) => {
-                    log::log!(
-                        if attempts.count > 30 { log::Level::Warn } else { log::Level::Debug },
-                        "download_next_block_worker (attempt {}): prev_id: {}, {}",
-                        attempts.count, prev_id, e
-                    );
-                },
-                Ok(block_and_proof) => break Ok(block_and_proof)
-            }
-            attempts.count += 1;
-            if (limit > 0) && (attempts.count > limit) {
-                fail!("download_next_block_worker: out of attempts");
-            }
-            timeout = 1000.0_f32.max(timeout * 1.1);
-            futures_timer::Delay::new(Duration::from_millis(timeout as u64)).await;
-        }
-*/
     }
 
     pub async fn download_block_worker(
         &self,
         id: &BlockIdExt,
-        limit: Option<u32>
+        limit: Option<u32>,
+        timeout: Option<(u64, u64, u64)>
     ) -> Result<(BlockStuff, BlockProofStuff)> {
         self.create_download_context(
             Arc::new(BlockDownloader),
             id, 
             limit, 
             "download_block_worker", 
-            None
+            timeout
         ).await?.download().await
-/*        
-        let client = self.get_full_node_overlay(
-            id.shard().workchain_id(),
-            ton_block::SHARD_FULL, // FIXME: which overlay id use?   id.shard().shard_prefix_with_tag()
-        ).await?;
-        let mut attempts = Attempts {
-            total_limit: limit,
-            limit: 0,
-            count: 0
-        };
-        loop {
-            match client.download_block_full(&id, &attempts).await {
-                Err(e) => {
-                    log::log!(
-                        if attempts.count > 10 { log::Level::Warn } else { log::Level::Debug },
-                        "download_block_worker (attempt {}): id: {}, {:?}",
-                        attempts.count, id, e
-                    );
-                },
-                Ok(None) => {
-                    log::log!(
-                        if attempts.count > 10 { log::Level::Warn } else { log::Level::Debug },
-                        "download_block_worker (attempt {}): id: {}, got no data",
-                        attempts.count, id
-                    );
-                },
-                Ok(Some((block, proof))) => break Ok((block, proof))
-            }
-            attempts.count += 1;
-            if (limit > 0) && (attempts.count > limit) {
-                fail!("download_block_worker: out of attempts");
-            }
-            futures_timer::Delay::new(Duration::from_millis(10)).await;
-        }
-*/
     }
 
     pub async fn download_block_proof_worker(
@@ -676,41 +677,6 @@ impl Engine {
             "download_block_proof_worker", 
             None
         ).await?.download().await
-/*
-        let client = self.get_full_node_overlay(
-            id.shard().workchain_id(),
-            ton_block::SHARD_FULL, // FIXME: which overlay id use?   id.shard().shard_prefix_with_tag()
-        ).await?;
-        let mut attempts = Attempts {
-            total_limit: limit,
-            limit: 0,
-            count: 0
-        };
-        loop {
-            match client.download_block_proof(&id, is_link, key_block, &attempts).await {
-                Err(e) => {
-                    log::log!(
-                        if attempts.count > 10 { log::Level::Warn } else { log::Level::Debug },
-                        "download_block_proof_worker (attempt {}): id: {}, {:?}",
-                        attempts.count, id, e
-                    );
-                },
-                Ok(None) => {
-                    log::log!(
-                        if attempts.count > 10 { log::Level::Warn } else { log::Level::Debug },
-                        "download_block_proof_worker (attempt {}): id: {}, got no data",
-                        attempts.count, id
-                    );
-                }
-                Ok(Some(proof)) => break Ok(proof)
-            }
-            attempts.count += 1;
-            if attempts.total_limit > 0 && attempts.count > attempts.total_limit {
-                fail!("download_block_proof_worker: out of attempts");
-            }
-            futures_timer::Delay::new(Duration::from_millis(10)).await;
-        }
-*/
     }
 
     pub async fn download_zerostate_worker(
@@ -723,26 +689,8 @@ impl Engine {
             id, 
             limit, 
             "download_zerostate_worker", 
-            Some((10, 3000))
+            Some((10, 12, 3000))
         ).await?.download().await
-/*
-        let mut timeout = 1.0;
-        loop {
-            let overlay = self.get_full_node_overlay(id.shard().workchain_id(), id.shard().shard_prefix_with_tag()).await?;
-            let attempts = Attempts {
-                total_limit: 0,
-                limit: 3,
-                count: 0
-            };
-            match overlay.download_zero_state(id, &attempts).await {
-                Err(e) => log::warn!("Can't load zerostate {}: {}", id, e),
-                Ok(None) => log::warn!("Can't load zerostate {}: none returned", id),
-                Ok(Some(zs)) => return Ok(zs)
-            }
-            timeout = 3000.0_f32.max(timeout * 1.2);
-            tokio::time::delay_for(Duration::from_millis(timeout as u64)).await;
-        }
-*/
     }
 
     pub(crate) async fn check_sync(&self) -> Result<bool> {
@@ -753,7 +701,9 @@ impl Engine {
             return Ok(false);
         }
 
-        let last_mc_handle = self.load_block_handle(&last_mc_id)?;
+        let last_mc_handle = self.load_block_handle(&last_mc_id)?.ok_or_else(
+            || error!("Cannot load handle for last masterchain block {}", last_mc_id)
+        )?;
         if last_mc_handle.gen_utime()? + 600 > self.now() {
             return Ok(true);
         }
@@ -770,7 +720,9 @@ impl Engine {
         Ok(self.is_validator())
     }
 
-    pub fn start_gc_scheduler(self: Arc<Self>) -> JoinHandle<()>{
+// Unused temporarily
+/* 
+    pub fn start_gc_scheduler(self: Arc<Self>) -> tokio::task::JoinHandle<()>{
         log::info!("Starting GC scheduler...");
 
         let handle = tokio::spawn(async move {
@@ -795,6 +747,7 @@ impl Engine {
 
         handle
     }
+*/
 
     async fn store_pss_keeper_block_id(&self, id: &BlockIdExt) -> Result<()> {
         PssKeeperBlockId(id.into()).store_to_db(self.db().deref())
@@ -803,7 +756,7 @@ impl Engine {
     pub fn start_persistent_states_keeper(
         engine: Arc<Engine>,
         pss_keeper_block: BlockIdExt
-    ) -> Result<JoinHandle<()>> {
+    ) -> Result<tokio::task::JoinHandle<()>> {
         let join_handle = tokio::spawn(async move {
             if let Err(e) = Self::persistent_states_keeper(engine, pss_keeper_block).await {
                 log::error!("FATAL!!! Unexpected error in persistent states keeper: {:?}", e);
@@ -819,7 +772,9 @@ impl Engine {
         if !pss_keeper_block.shard().is_masterchain() {
             fail!("'pss_keeper_block' mast belong master chain");
         }
-        let mut handle = engine.load_block_handle(&pss_keeper_block)?;
+        let mut handle = engine.load_block_handle(&pss_keeper_block)?.ok_or_else(
+            || error!("Cannot load handle for PSS keeper block {}", pss_keeper_block)
+        )?;
         loop {
             if handle.is_key_block()? {
                 let mc_state = engine.load_state(handle.id()).await?;
@@ -828,12 +783,15 @@ impl Engine {
                 } else {
                     if let Some(prev_key_block_id) =
                         mc_state.shard_state_extra()?.prev_blocks.get_prev_key_block(handle.id().seq_no() - 1)? {
-                        let prev_handle = engine.load_block_handle(&BlockIdExt {
+                        let block_id = BlockIdExt {
                             shard_id: ShardIdent::masterchain(),
                             seq_no: prev_key_block_id.seq_no,
                             root_hash: prev_key_block_id.root_hash,
                             file_hash: prev_key_block_id.file_hash
-                        })?;
+                        };
+                        let prev_handle = engine.load_block_handle(&block_id)?.ok_or_else(
+                            || error!("Cannot load handle for PSS keeper prev key block {}", block_id)
+                        )?;
                         engine.is_persistent_state(handle.gen_utime()?, prev_handle.gen_utime()?)
                     } else {
                         false
@@ -862,8 +820,10 @@ impl Engine {
                         log::trace!("persistent_states_keeper: saving {}", block_id);
                         let now = std::time::Instant::now();
                         
-                        let handle = engine.load_block_handle(&block_id)?;
-                        let ss = engine.wait_state(&handle).await?;
+                        let ss = engine.clone().wait_state(&block_id, None).await?;
+                        let handle = engine.load_block_handle(&block_id)?.ok_or_else(
+                            || error!("Cannot load handle for PSS keeper shard block {}", block_id)
+                        )?;
                         engine.store_persistent_state_attempts(&handle, &ss).await;
 
                         log::trace!("persistent_states_keeper: saved {} TIME {}ms",
@@ -871,7 +831,7 @@ impl Engine {
                     };
                 }
             }
-            handle = engine.wait_next_applied_mc_block(&handle).await?.0;
+            handle = engine.wait_next_applied_mc_block(&handle, None).await?.0;
             engine.store_pss_keeper_block_id(handle.id(), ).await?;
         }
     }
@@ -887,18 +847,20 @@ impl Engine {
 }
 
 pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<bool> {
-    let handle = engine.load_block_handle(engine.zero_state_id())?;
-
-    if handle.applied() {
-        return Ok(false);
+ 
+    let zero_id = engine.zero_state_id();
+    if let Some(handle) = engine.load_block_handle(zero_id)? {
+        if handle.is_applied() {
+            return Ok(false);
+        }
     }
 
     let (mc_zero_state, mc_zs_bytes) = {
-        log::trace!("loading mc static zero state {}", handle.id());
-        let path = format!("{}/{:x}.boc", path, handle.id().file_hash());
+        log::trace!("loading mc static zero state {}", zero_id);
+        let path = format!("{}/{:x}.boc", path, zero_id.file_hash());
         let bytes = tokio::fs::read(&path).await
             .map_err(|err| error!("Cannot read mc zerostate {}: {}", path, err))?;
-        (ShardStateStuff::deserialize_zerostate(handle.id().clone(), &bytes)?, bytes)
+        (ShardStateStuff::deserialize_zerostate(zero_id.clone(), &bytes)?, bytes)
     };
 
     let mut zerostates_ids = vec!();
@@ -913,23 +875,25 @@ pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<
     })?;
 
     for id in &zerostates_ids {
-        let handle = engine.load_block_handle(id)?;
-        if !handle.applied() {
-            log::trace!("loading wc static zero state {}", id);
-            let path = format!("{}/{:x}.boc", path, id.file_hash());
-            let bytes = tokio::fs::read(&path).await
-                .map_err(|err| error!("Cannot read zerostate {}: {}", path, err))?;
-            let zs = ShardStateStuff::deserialize_zerostate(handle.id().clone(), &bytes)?;
-            engine.store_zerostate(&handle, &zs, &bytes).await?;
-            engine.set_applied(&handle, handle.id().seq_no()).await?;
+        if let Some(handle) = engine.load_block_handle(id)? {
+            if handle.is_applied() {
+                continue
+            }
         }
+        log::trace!("loading wc static zero state {}", id);
+        let path = format!("{}/{:x}.boc", path, id.file_hash());
+        let bytes = tokio::fs::read(&path).await
+            .map_err(|err| error!("Cannot read zerostate {}: {}", path, err))?;
+        let zs = ShardStateStuff::deserialize_zerostate(id.clone(), &bytes)?;
+        let handle = engine.store_zerostate(id, &zs, &bytes).await?;
+        engine.set_applied(&handle, id.seq_no()).await?;
     }
 
-    engine.store_zerostate(&handle, &mc_zero_state, &mc_zs_bytes).await?;
-    engine.set_applied(&handle, handle.id().seq_no()).await?;
-
+    let handle = engine.store_zerostate(&zero_id, &mc_zero_state, &mc_zs_bytes).await?;
+    engine.set_applied(&handle, zero_id.seq_no()).await?;
     log::trace!("All static zero states had been load");
     return Ok(true)
+
 }
 
 async fn boot(engine: &Arc<Engine>, zerostate_path: Option<&str>) -> Result<(BlockIdExt, BlockIdExt, BlockIdExt)> {
@@ -984,33 +948,68 @@ async fn boot(engine: &Arc<Engine>, zerostate_path: Option<&str>) -> Result<(Blo
     Ok((last_mc_block, shards_client_block, pss_keeper_block))
 }
 
-pub async fn run(node_config: TonNodeConfig, zerostate_path: Option<&str>, ext_db: Vec<Arc<dyn ExternalDb>>) -> Result<()> {
+fn run_full_node_service(engine: Arc<Engine>) -> Result<Arc<FullNodeOverlayService>> {
+    let full_node_service = Arc::new(
+        FullNodeOverlayService::new(Arc::clone(&engine) as Arc<dyn EngineOperations>)
+    );
+    let network = engine.network();
+    network.add_consumer(
+        &network.calc_overlay_id(MASTERCHAIN_ID, SHARD_FULL)?.0,
+        full_node_service.clone() as Arc<dyn QueriesConsumer>
+    )?;
+    network.add_consumer(
+        &network.calc_overlay_id(BASE_WORKCHAIN_ID, SHARD_FULL)?.0,
+        full_node_service.clone() as Arc<dyn QueriesConsumer>
+    )?;
+
+    Ok(full_node_service)
+}
+
+async fn run_control_server(engine: Arc<Engine>, config: AdnlServerConfig) -> Result<ControlServer> {
+    ControlServer::with_config(
+        config,
+        Some(Arc::clone(&engine) as Arc<dyn EngineOperations>),
+        engine.network().config_handler(),
+        engine.network().config_handler()
+    ).await
+}
+
+pub async fn run(node_config: TonNodeConfig, zerostate_path: Option<&str>, ext_db: Vec<Arc<dyn ExternalDb>>, initial_sync_disabled : bool) -> Result<()> {
     log::info!("Engine::run");
 
     let consumer_config = node_config.kafka_consumer_config();
+    let control_server_config = node_config.control_server()?;
 
-    //// Create engine
-    let engine = Engine::new(node_config, ext_db).await?;
+    // Create engine
+    let engine = Engine::new(node_config, ext_db, initial_sync_disabled).await?;
 
-    //// Boot
+    // Full node's service
+    let _ = run_full_node_service(engine.clone())?;
+
+    // Console service
+    if let Some(config) = control_server_config {
+        let control_server = run_control_server(engine.clone(), config).await?;
+        // Asking the compiler not to drop `control_server`, despite we don't have any link to it.
+        let _ = ManuallyDrop::new(control_server);
+    };
+
+    // Boot
     let (mut last_mc_block, mut shards_client_mc_block, pss_keeper_block) = boot(&engine, zerostate_path).await?;
 
-    //// Start services
+    // Messages from external DB (usually kafka)
     start_external_broadcast_process(engine.clone(), &consumer_config)?;
 
-    // TODO: Temporary disabled GC because of DB corruption. Enable after fix.
-    // Arc::clone(&engine).start_gc_scheduler();
-
-    // broadcasts
+    // Broadcasts (blocks, external messages etc.)
     Arc::clone(&engine).listen_broadcasts(ShardIdent::masterchain()).await?;
     Arc::clone(&engine).listen_broadcasts(ShardIdent::with_tagged_prefix(BASE_WORKCHAIN_ID, SHARD_FULL)?).await?;
 
+    // Saving of persistenr states (for sync)
     let _ = Engine::start_persistent_states_keeper(engine.clone(), pss_keeper_block)?;
 
-    // start validator manager, which will start validator sessions when necessary
+    // Start validator manager, which will start validator sessions when necessary
     start_validator(Arc::clone(&engine));
 
-    // sync by archives
+    // Sync by archives
     if !engine.check_sync().await? {
         crate::sync::start_sync(Arc::clone(&engine) as Arc<dyn EngineOperations>).await?;
         last_mc_block = LastMcBlockId::load_from_db(engine.db().deref())
@@ -1018,6 +1017,9 @@ pub async fn run(node_config: TonNodeConfig, zerostate_path: Option<&str>, ext_d
         shards_client_mc_block = ShardsClientMcBlockId::load_from_db(engine.db().deref())
             .and_then(|id| (&id.0).try_into())?;
     }
+
+    // top shard blocks
+    resend_top_shard_blocks_worker(engine.clone());
 
     // blocks download clients
     let _ = start_shards_client(engine.clone(), shards_client_mc_block)?;
@@ -1037,7 +1039,7 @@ fn start_validator(engine: Arc<Engine>) {
                 }
                 return;
             }
-            delay_for(Duration::from_secs(CHECK_VALIDATOR_TIMEOUT)).await;
+            tokio::time::delay_for(Duration::from_secs(CHECK_VALIDATOR_TIMEOUT)).await;
         }
     });
 }
@@ -1100,6 +1102,7 @@ impl StatsdClient {
     pub fn gauge(&self, _metric_name: &str, _value: f64) {}
     pub fn incr(&self, _metric_name: &str) {}
     pub fn histogram(&self, _metric_name: &str, _value: f64) {}
+    #[cfg(feature = "external_db")]
     pub fn timer(&self, _metric_name: &str, _value: f64) {}
 }
 

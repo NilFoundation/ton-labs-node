@@ -1,13 +1,11 @@
 use crate::{network::node_network::NodeNetwork};
 use adnl::{from_slice, client::AdnlClientConfigJson,
-    common::{KeyId, KeyOption, KeyOptionJson, Wait},
+    common::{add_object_to_map_with_update, KeyId, KeyOption, KeyOptionJson, Wait},
     node::{AdnlNodeConfig, AdnlNodeConfigJson},
     server::{AdnlServerConfig, AdnlServerConfigJson}
 };
-use hex::FromHex;
 use std::{
-    collections::HashMap, io::{BufReader}, fs::File,
-    net::{Ipv4Addr, IpAddr, SocketAddr}, path::Path,
+    collections::HashMap, io::{BufReader}, fs::File, path::Path,
     sync::{Arc, atomic::{self, AtomicI32} }
 };
 use ton_api::{
@@ -58,6 +56,8 @@ pub struct TonNodeConfig {
     control_server: Option<AdnlServerConfigJson>,
     kafka_consumer_config: Option<KafkaConsumerConfig>,
     external_db_config: Option<ExternalDbConfig>,
+    #[serde(default)]
+    test_bundles_config: CollatorTestBundlesGeneralConfig,
     validator_key_ring: Option<HashMap<String, KeyOptionJson>>,
     #[serde(skip)]
     configs_dir: String,
@@ -108,6 +108,42 @@ pub struct ExternalDbConfig {
     pub bad_blocks_storage: String,
 }
 
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize, Clone)]
+#[serde(default)]
+pub struct CollatorTestBundlesConfig {
+    build_for_unknown_errors: bool,
+    known_errors: Vec<String>,
+    build_for_errors: bool,
+    errors: Vec<String>,
+    path: String,
+}
+
+impl CollatorTestBundlesConfig {
+
+    pub fn is_enable(&self) -> bool {
+        self.build_for_unknown_errors ||
+            (self.build_for_errors && self.errors.len() > 0)
+    }
+
+    pub fn need_to_build_for(&self, error: &str) -> bool {
+        self.build_for_unknown_errors &&
+            self.known_errors.iter().all(|e| !error.contains(e))
+        || self.build_for_errors && 
+            self.errors.iter().any(|e| error.contains(e))
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize, Clone)]
+#[serde(default)]
+pub struct CollatorTestBundlesGeneralConfig {
+    pub collator: CollatorTestBundlesConfig,
+    pub validator: CollatorTestBundlesConfig,
+}
+
 const LOCAL_HOST: &str = "127.0.0.1";
 
 impl TonNodeConfig {
@@ -135,7 +171,8 @@ impl TonNodeConfig {
                 // generate new config from default_config
                 let default_config_file = File::open(
                     TonNodeConfig::build_path(configs_dir, default_config_name)?
-                )?;
+                ).map_err(|err| error!("Can`t open {}: {}", default_config_name, err))?;
+
                 let reader = BufReader::new(default_config_file);
                 let mut config: TonNodeConfig = serde_json::from_reader(reader)?;
                 // Set ADNL config
@@ -179,12 +216,8 @@ impl TonNodeConfig {
         Ok(ret)
     }
 
-    pub fn control_server(&self) -> Result<AdnlServerConfig> {
-        if let Some(control_server) = &self.control_server {
-            AdnlServerConfig::from_json_config(control_server)
-        } else {
-            fail!("Control server is not configured")
-        }
+    pub fn control_server(&self) -> Result<Option<AdnlServerConfig>> {
+        self.control_server.as_ref().map(|cs| AdnlServerConfig::from_json_config(cs)).transpose()
     }
 
     pub fn log_config_path(&self) -> Option<String> {
@@ -203,26 +236,30 @@ impl TonNodeConfig {
     pub fn internal_db_path(&self) -> Option<&str> {
         self.internal_db_path.as_ref().map(|path| path.as_str())
     }
-    pub fn set_internal_db_path(&mut self, path: String) {
-        self.internal_db_path.replace(path);
-    }
+    
+  
     pub fn external_db_config(&self) -> Option<ExternalDbConfig> {
         self.external_db_config.clone()
     }
-
-    pub fn set_port(&mut self, port: u16) {
-        self.port.replace(port);
+    pub fn test_bundles_config(&self) -> &CollatorTestBundlesGeneralConfig {
+        &self.test_bundles_config
     }
+
  
     pub fn load_global_config(&self) -> Result<TonNodeGlobalConfig> {
-        let name = self.ton_global_config_name.as_ref()
-            .ok_or_else(|| error!("global config informations not found!"))?;
-
+        let name = self.ton_global_config_name.as_ref().ok_or_else(
+            || error!("global config informations not found!")
+        )?;
         let global_config_path = TonNodeConfig::build_path(&self.configs_dir, &name)?;
-
+/*        
         let data = std::fs::read_to_string(global_config_path)
             .map_err(|err| error!("Global config file is not found! : {}", err))?;
-        TonNodeGlobalConfig::from_json(&data)
+*/
+        TonNodeGlobalConfig::from_json_file(global_config_path.as_str())
+    }
+
+    pub fn remove_all_validator_keys(&mut self) {
+        self.validator_keys = None;
     }
 
     fn create_and_save_console_configs(
@@ -249,7 +286,8 @@ impl TonNodeConfig {
             ))?,
             None
         );
-        std::fs::write(config_file_path, serde_json::to_string_pretty(&console_client_config)?)?;
+        std::fs::write(config_file_path, serde_json::to_string_pretty(&console_client_config)?)
+            .map_err(|err| error!("Can`t create console_config.json: {}", err))?;
 
         // generate and save server config
         let client_keys = if let Some(client_key) = client_pub_key {
@@ -341,14 +379,28 @@ impl TonNodeConfig {
         Ok((key_id.clone(), Arc::new(public)))
     }
 
-    fn add_validator_key(&mut self, key_id: &[u8; 32], election_date: i32) -> Result<ValidatorKeysJson> {
+    fn is_correct_election_id(&self, election_id: i32) -> bool {
+        if let Some(validator_keys) = &self.validator_keys {
+            for key_json in validator_keys {
+                if key_json.election_id > election_id {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    fn add_validator_key(&mut self, key_id: &[u8; 32], election_id: i32) -> Result<ValidatorKeysJson> {
         let key_info = ValidatorKeysJson {
-            election_id: election_date,
+            election_id: election_id,
             validator_key_id: base64::encode(key_id),
             validator_adnl_key_id: None
         };
 
-        let added_key_info = self.get_validator_key_info_by_election_id(&election_date)?;
+        if !self.is_correct_election_id(election_id) {
+            fail!("Invalid arg: bad election_id!");
+        }
+        let added_key_info = self.get_validator_key_info_by_election_id(&election_id)?;
         match &mut self.validator_keys {
             Some(validator_keys) => {
                 match added_key_info {
@@ -392,6 +444,12 @@ impl TonNodeConfig {
             }
         }
         Ok(false)
+    }
+
+    fn remove_key_from_key_ring(&mut self, validator_key_id: &String) {
+        if let Some(key_ring) = self.validator_key_ring.as_mut() {
+            key_ring.remove(validator_key_id);
+        }
     }
 }
 
@@ -488,6 +546,17 @@ impl NodeConfigHandler {
        result
     }
 
+    pub async fn get_actual_validator_adnl_ids(&self) -> Result<Vec<Arc<KeyId>>> {
+        let adnl_ids = self.validator_keys.get_validator_adnl_ids();
+        let mut result = Vec::new();
+
+        for adnl_id in adnl_ids.iter() {
+            let id = base64::decode(adnl_id)?;
+            result.push(KeyId::from_data(from_slice!(id, 32)));
+        }
+        Ok(result)
+    }
+
     pub async fn get_validator_key(&self, key_id: &Arc<KeyId>) -> Option<(KeyOption, i32)> {
         match self.validator_keys.get(&base64::encode(key_id.data())) {
             Some(key) => {
@@ -553,6 +622,10 @@ impl NodeConfigHandler {
                                     oldest_key.election_id
                                 )?;
                                 validator_keys.remove(&oldest_key)?;
+                                config.remove_key_from_key_ring(&oldest_key.validator_key_id.clone());
+                                if let Some(adnl_key_id) = oldest_key.validator_adnl_key_id {
+                                    config.remove_key_from_key_ring(&adnl_key_id);
+                                }
                         }
                     } else {
                         break;
@@ -734,12 +807,18 @@ impl KeyRing for NodeConfigHandler {
 }
 
 impl TonNodeGlobalConfig {
+
     /// Constructor from json file
+    pub fn from_json_file(json_file: &str) -> Result<Self> {
+        let ton_node_global_cfg_json = TonNodeGlobalConfigJson::from_json_file(json_file)?;
+        Ok(TonNodeGlobalConfig(ton_node_global_cfg_json))
+    }
+/*
     pub fn from_json(json : &str) -> Result<Self> {
         let ton_node_global_cfg_json = TonNodeGlobalConfigJson::from_json(&json)?;
-        Ok(TonNodeGlobalConfig(serde::export::Some(ton_node_global_cfg_json)
-            .ok_or_else(|| error!("Global cannot be parsed!"))?))
+        Ok(TonNodeGlobalConfig(ton_node_global_cfg_json))
     }
+*/
 
     pub fn zero_state(&self) -> Result<BlockIdExt> {
         self.0.zero_state()
@@ -753,19 +832,16 @@ impl TonNodeGlobalConfig {
         self.0.get_dht_nodes_configs()
     }
 
-    pub fn dht_param_a(&self) -> Result<i32> {
-        self.0.dht.a.ok_or_else(|| error!("Dht param a is not set!"))
-    }
+// Unused
+//    pub fn dht_param_a(&self) -> Result<i32> {
+//        self.0.dht.a.ok_or_else(|| error!("Dht param a is not set!"))
+//    }
 
-    pub fn dht_param_k(&self) -> Result<i32> {
-        self.0.dht.k.ok_or_else(|| error!("Dht param k is not set!"))
-        // let res : Vec<AdnlNodeConfig> = if let Some(ton_node_cfg) = &self.ton_node_global_config_json {
-        //     ton_node_cfg.get_adnl_nodes_configs()?
-        // } else {
-        //     fail!("Global config is not found!")
-        // };
-        // Ok(res)
-    }
+// Unused
+//    pub fn dht_param_k(&self) -> Result<i32> {
+//        self.0.dht.k.ok_or_else(|| error!("Dht param k is not set!"))
+//    }
+
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -864,43 +940,6 @@ struct InitBlock {
     file_hash : Option<String>,
 }
 
-impl Address {
-    pub fn convert_address(&self) -> Result<SocketAddr> {
-       let ip = if let Some(addr) = &self.ip() {
-             IpAddr::V4(Address::convert_ip_addr(addr)?)
-        } else {
-             fail!("IP address not found!");
-        };
-
-        let port = self.port.ok_or_else(|| error!("Port not found!"))?;
-        let addr : SocketAddr = SocketAddr::new(ip, port);
-        Ok(addr)
-    }
-
-    const IP_ADDR_COUNT_FIELDS : usize = 4;
-
-    pub fn convert_ip_addr(intel_format_ip : &i64) -> Result<Ipv4Addr> {
-        let ip_hex = format!("{:08x}", intel_format_ip);
-        let mut ip_hex: Vec<u8> = Vec::from_hex(ip_hex)?;
-
-        ip_hex.reverse();
-        if ip_hex.len() < Address::IP_ADDR_COUNT_FIELDS {
-            fail!("IP address is bad");
-        }
-
-        let address = Ipv4Addr::new(ip_hex[3], ip_hex[2], ip_hex[1], ip_hex[0]);
-         Ok(address)
-    }
-
-    pub fn to_str(&self) -> Result<String> {
-         serde::export::Ok(self.convert_address()?.to_string())
-    }
-
-    pub fn ip(&self) -> Option<&i64> {
-        self.ip.as_ref()
-    }
-}
-
 pub const PUB_ED25519 : &str = "pub.ed25519";
 
 impl IdDhtNode {
@@ -928,36 +967,21 @@ impl IdDhtNode {
     }
 }
 
-/*
-impl DhtNode {
-    pub fn convert_to_adnl_node_cfg(&self) -> Result<AdnlNodeConfig> {
-        let key_option = self.id.convert_key()?;
-        //TODO!!!!
-        let address = self.addr_list.addrs[0].to_str()?;
-        let ret = AdnlNodeConfig::from_ip_address_and_key(
-            &address,
-            key_option,
-            NodeNetwork::TAG_DHT_KEY
-        )?;
-        Ok(ret)
-    }
-}
-*/
-
 impl TonNodeGlobalConfigJson {
     
-    pub fn from_json_file(json_file : &str) -> Result<Self> {
+    /// Constructs new configuration from JSON data
+    pub fn from_json_file(json_file: &str) -> Result<Self> {
         let file = File::open(json_file)?;
         let reader = BufReader::new(file);
-        let json_config : TonNodeGlobalConfigJson = serde_json::from_reader(reader)?;
+        let json_config: TonNodeGlobalConfigJson = serde_json::from_reader(reader)?;
         Ok(json_config)
     }
-
-    /// Constructs new configuration from JSON data
-    pub fn from_json(json : &str) -> Result<Self> {
-        let json_config : TonNodeGlobalConfigJson = serde_json::from_str(json)?;
+/*
+    pub fn from_json(json: &str) -> Result<Self> {
+        let json_config: TonNodeGlobalConfigJson = serde_json::from_str(json)?;
         Ok(json_config)
     }
+*/
 
     pub fn get_dht_nodes_configs(&self) -> Result<Vec<DhtNodeConfig>> {
         let mut result = Vec::new();
@@ -1128,19 +1152,39 @@ impl ValidatorKeys {
     }
 
     fn add(&self, key: ValidatorKeysJson) -> Result<()> {
-        self.values.insert(key.election_id, key.clone());
-
         // inserted in sorted order
-        let mut current = self.first.load(atomic::Ordering::Relaxed);
+        let mut first = false;
 
-        if current == 0 {
-            self.first.store(key.election_id, atomic::Ordering::Relaxed);
+        add_object_to_map_with_update(&self.values, key.election_id, |_| {
+            if self.first.compare_exchange(0, key.election_id, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok() {
+                first = true;
+            }
+            Ok(Some(key.clone()))
+        })?;
+
+        if first {
             return Ok(());
         }
 
+        let mut current = self.first.load(atomic::Ordering::Relaxed);
         if current > key.election_id {
-            self.index.insert(key.election_id, current);
-            self.first.store(key.election_id, atomic::Ordering::Relaxed);
+            add_object_to_map_with_update(&self.index, key.election_id, |_| {
+                if let Err(prev) = self.first.fetch_update(
+                    atomic::Ordering::Relaxed, atomic::Ordering::Relaxed, |x| {
+                    if x > key.election_id {
+                        Some(key.election_id)
+                    } else {
+                        None
+                    }
+                }) {
+                    let old = self.index.insert(prev, key.election_id).ok_or_else(
+                        || error!("validator keys collections was broken!")
+                    )?;
+                    Ok(Some(*old.val()))
+                } else {
+                    Ok(Some(current))
+                }
+            })?;
             return Ok(());
         } else if current == key.election_id {
             return Ok(())
@@ -1149,8 +1193,10 @@ impl ValidatorKeys {
         loop {
             if let Some(item) = &self.index.get(&current) {
                 if item.val() > &key.election_id {
-                    self.index.insert(key.election_id, *item.val());
-                    self.index.insert(*item.key(), key.election_id);
+                    add_object_to_map_with_update(&self.index, *item.key(), |_| {
+                        self.index.insert(key.election_id, *item.val());
+                        Ok(Some(key.election_id))
+                    })?;
                     break;
                 } else if item.val() == &key.election_id {
                     break;
@@ -1219,5 +1265,23 @@ impl ValidatorKeys {
             }
         }
         result
+    }
+
+    fn get_validator_adnl_ids(&self) -> Vec<String> {
+        let mut adnl_ids = Vec::new();
+        let mut current = self.first.load(atomic::Ordering::Relaxed);
+        loop {
+            if let Some(validator_info) = self.values.get(&current) {
+                if let Some(adnl_key) = &validator_info.val().validator_adnl_key_id {
+                    adnl_ids.push(adnl_key.clone());
+                } else {
+                    adnl_ids.push(validator_info.val().validator_key_id.clone());
+                }
+            }
+            match self.index.get(&current) {
+                Some(next) => current = *next.val(),
+                None => return adnl_ids
+            }
+        }
     }
 }
