@@ -67,7 +67,7 @@ ton_types = { git = "https://github.com/tonlabs/ton-labs-types" }
 ton_vm = { git = "https://github.com/nilfoundation/rust-tvm", branch = "1-vergrth16-tvm-instruction" }
 validator_session = { path = "validator-session" }
 
-crusty3-zk = { git = "https://github.com/nilfoundation/crusty3-zk" }
+crusty3_zk = { git = "https://github.com/nilfoundation/crusty3-zk" }
 
 [target.'cfg(windows)'.dependencies.rdkafka]
 version = "0.23.1"
