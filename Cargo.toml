@@ -68,10 +68,13 @@ storage = { path = "storage" }
 ton_api = { git = "https://github.com/tonlabs/ton-labs-tl", package = "ton_api" }
 ton_block = { git = "https://github.com/tonlabs/ton-labs-block" }
 ton_block_json = { git = "https://github.com/tonlabs/ton-labs-block-json.git" }
-ton_executor = { git = "https://github.com/tonlabs/ton-labs-executor" }
+ton_executor = { git = "https://github.com/nilfoundation/ton-executor"}
+ton-node-storage = { git = "https://github.com/tonlabs/ton-labs-node-storage.git" }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types" }
-ton_vm = { git = "https://github.com/tonlabs/ton-labs-vm" }
+ton_vm = { git = "https://github.com/nilfoundation/rust-tvm" }
 validator_session = { path = "validator-session" }
+
+crusty3_zk = { git = "https://github.com/nilfoundation/crusty3-zk" }
 
 [target.'cfg(windows)'.dependencies.rdkafka]
 version = "0.23.1"
