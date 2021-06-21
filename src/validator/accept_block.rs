@@ -54,7 +54,7 @@ pub async fn accept_block(
     //     return;
     // }
 
-    let handle = if let Some(handle) = engine.load_block_handle(&id)? {
+    let handle_opt = if let Some(handle) = engine.load_block_handle(&id)? {
         if handle.is_applied() {
             log::debug!(target: "validator", "Accept-block: {} is already applied", id);
             return Ok(())
@@ -76,10 +76,20 @@ pub async fn accept_block(
         }
     };
 
-    let mut handle = if let Some(handle) = handle {
-        handle
+    let mut handle;
+    if let Some(h) = handle_opt {
+        handle = h;
     } else {
-        engine.store_block(&block).await?
+        #[cfg(feature = "telemetry")] {
+            let r = engine.store_block(&block).await?;
+            handle = r.handle;
+            if r.first_time {
+                handle.set_got_by_broadcast(true);
+            }
+        }
+        #[cfg(not(feature = "telemetry"))] {
+            handle = engine.store_block(&block).await?.handle
+        }
     };
 
     // TODO - if signatures is not set - `ValidatorManager::set_block_signatures` ??????
@@ -193,7 +203,7 @@ async fn choose_mc_state(
             block.id(),
             mc_block_id
         );
-        let new_mc_state = engine.clone().wait_state(&mc_block_id, Some(60_000)).await?;
+        let new_mc_state = engine.clone().wait_state(&mc_block_id, Some(60_000), true).await?;
         new_mc_state
             .shard_state_extra()?
             .prev_blocks

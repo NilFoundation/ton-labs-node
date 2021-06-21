@@ -7,6 +7,7 @@ use crate::{
     ext_messages::create_ext_message,
     jaeger,
     config::CollatorTestBundlesGeneralConfig,
+    internal_db::StoreBlockResult,
 };
 use adnl::common::{KeyId, KeyOption};
 use catchain::{
@@ -21,6 +22,13 @@ use storage::types::BlockHandle;
 use ton_api::ton::ton_node::broadcast::BlockBroadcast;
 use ton_block::{AccountIdPrefixFull, BlockIdExt, Message, ShardIdent};
 use ton_types::{fail, Result, UInt256};
+#[cfg(feature = "telemetry")]
+use crate::{
+    full_node::telemetry::FullNodeTelemetry,
+    validator::telemetry::CollatorValidatorTelemetry,
+    network::telemetry::FullNodeNetworkTelemetry,
+};
+
 
 #[async_trait::async_trait]
 pub trait OverlayOperations : Sync + Send {
@@ -153,6 +161,16 @@ pub trait EngineOperations : Sync + Send {
         mc_seq_no: u32, 
         pre_apply: bool
     ) -> Result<()> {
+        self.apply_block_internal(handle, block, mc_seq_no, pre_apply, 0).await
+    }
+    async fn apply_block_internal(
+        self: Arc<Self>, 
+        handle: &Arc<BlockHandle>, 
+        block: &BlockStuff, 
+        mc_seq_no: u32, 
+        pre_apply: bool,
+        recursion_depth: u32
+    ) -> Result<()> {
         unimplemented!()
     }
     async fn download_and_apply_block(
@@ -160,6 +178,15 @@ pub trait EngineOperations : Sync + Send {
         id: &BlockIdExt, 
         mc_seq_no: u32, 
         pre_apply: bool
+    ) -> Result<()> {
+        self.download_and_apply_block_internal(id, mc_seq_no, pre_apply, 0).await
+    }
+    async fn download_and_apply_block_internal(
+        self: Arc<Self>, 
+        id: &BlockIdExt, 
+        mc_seq_no: u32, 
+        pre_apply: bool,
+        recursion_depth: u32
     ) -> Result<()> {
         unimplemented!()
     }
@@ -175,7 +202,7 @@ pub trait EngineOperations : Sync + Send {
     async fn download_next_key_blocks_ids(&self, block_id: &BlockIdExt, priority: u32) -> Result<Vec<BlockIdExt>> {
         unimplemented!()
     }
-    async fn store_block(&self, block: &BlockStuff) -> Result<Arc<BlockHandle>> {
+    async fn store_block(&self, block: &BlockStuff) -> Result<StoreBlockResult> {
         unimplemented!()
     }
     async fn store_block_proof(
@@ -232,7 +259,12 @@ pub trait EngineOperations : Sync + Send {
     ) -> Result<Vec<u8>> {
         unimplemented!()
     }
-    async fn wait_state(self: Arc<Self>, id: &BlockIdExt, timeout_ms: Option<u64>) -> Result<ShardStateStuff> {
+    async fn wait_state(
+        self: Arc<Self>,
+        id: &BlockIdExt,
+        timeout_ms: Option<u64>,
+        allow_block_downloading: bool
+    ) -> Result<ShardStateStuff> {
         unimplemented!()
     }
     async fn store_state(
@@ -425,6 +457,8 @@ pub trait EngineOperations : Sync + Send {
                 &AccountIdPrefixFull::checked_prefix(&header.dst)?,
                 message_data
             ).await;
+            #[cfg(feature = "telemetry")]
+            self.full_node_telemetry().sent_ext_msg_broadcast();
             jaeger::broadcast_sended(id.to_hex_string());
             res
         } else {
@@ -434,7 +468,7 @@ pub trait EngineOperations : Sync + Send {
 
     // Boot specific operations
 
-    async fn set_applied(&self, handle: &Arc<BlockHandle>, mc_seq_no: u32) -> Result<()> {
+    async fn set_applied(&self, handle: &Arc<BlockHandle>, mc_seq_no: u32) -> Result<bool> {
         unimplemented!()
     }
 
@@ -451,6 +485,26 @@ pub trait EngineOperations : Sync + Send {
         masterchain_seqno: u32,
         active_peers: &Arc<lockfree::set::Set<Arc<KeyId>>>
     ) -> Result<Option<Vec<u8>>> {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn full_node_telemetry(&self) -> &FullNodeTelemetry {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn collator_telemetry(&self) -> &CollatorValidatorTelemetry {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn validator_telemetry(&self) -> &CollatorValidatorTelemetry {
+        unimplemented!()
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn full_node_service_telemetry(&self) -> &FullNodeNetworkTelemetry {
         unimplemented!()
     }
 }

@@ -9,12 +9,12 @@ use crate::{
     types::awaiters_pool::AwaitersPool,
 };
 use adnl::{
-    common::{KeyId, KeyOption, serialize}, node::{AddressCacheIterator, AdnlNode}
+    common::{KeyId, KeyOption, serialize}, node::AdnlNode
 };
 use catchain::{
     CatchainNode, CatchainOverlay, CatchainOverlayListenerPtr, CatchainOverlayLogReplayListenerPtr
 };
-use dht::DhtNode;
+use dht::{DhtIterator, DhtNode};
 use overlay::{
     BroadcastSendInfo, OverlayId, OverlayShortId, OverlayNode, QueriesConsumer, 
     PrivateOverlayShortId
@@ -28,13 +28,13 @@ use std::{
 };
 use ton_types::{Result, fail, error, UInt256};
 use ton_block::BlockIdExt;
+use ton_api::IntoBoxed;
 use ton_api::ton::{
     int256, bytes,
-    ton_node::{
-        broadcast::ConnectivityCheckBroadcast,
-        Broadcast::{TonNode_ConnectivityCheckBroadcast}
-    }
+    ton_node::broadcast::ConnectivityCheckBroadcast,
 };
+#[cfg(feature = "telemetry")]
+use crate::network::telemetry::FullNodeNetworkTelemetry;
 
 type Cache<K, T> = lockfree::map::Map<K, T>;
 
@@ -51,6 +51,8 @@ pub struct NodeNetwork {
     runtime_handle: tokio::runtime::Handle,
     config_handler: Arc<NodeConfigHandler>,
     connectivity_check_config: ConnectivityCheckBroadcastConfig,
+    #[cfg(feature = "telemetry")]
+    telemetry: Arc<FullNodeNetworkTelemetry>,
 }
 
 struct ValidatorContext {
@@ -150,6 +152,8 @@ impl NodeNetwork {
             runtime_handle: tokio::runtime::Handle::current(),
             config_handler,
             connectivity_check_config,
+            #[cfg(feature = "telemetry")]
+            telemetry: Arc::new(FullNodeNetworkTelemetry::default()),
         });
 
         if connectivity_check_enabled {
@@ -355,7 +359,7 @@ impl NodeNetwork {
     async fn update_overlay_peers(
         &self, 
         overlay_id: &Arc<OverlayShortId>,
-        iter: &mut Option<AddressCacheIterator>
+        iter: &mut Option<DhtIterator>
     ) -> Result<Vec<Arc<KeyId>>> {
         log::info!("Overlay {} node search in progress...", overlay_id);
         let nodes = DhtNode::find_overlay_nodes(&self.dht, overlay_id, iter).await?;
@@ -373,7 +377,7 @@ impl NodeNetwork {
     async fn update_peers(
         &self, 
         client_overlay: &Arc<NodeClientOverlay>,
-        iter: &mut Option<AddressCacheIterator>
+        iter: &mut Option<DhtIterator>
     ) -> Result<()> {
         let mut peers = self.update_overlay_peers(client_overlay.overlay_id(), iter).await?;
         while let Some(peer) = peers.pop() {
@@ -468,20 +472,16 @@ impl NodeNetwork {
             log::warn!("No nodes were found in overlay {}", &overlay_id.0);
         }
 
-        let neighbours = Neighbours::new(
-            &peers,
-            &self.dht,
-            &self.overlay,
-            overlay_id.0.clone()
-        )?;
-
+        let neighbours = Neighbours::new(&peers, &self.dht, &self.overlay, overlay_id.0.clone())?;
         let peers = Arc::new(neighbours);
 
         let client_overlay = NodeClientOverlay::new(
             overlay_id.0.clone(),
             self.overlay.clone(),
             self.rldp.clone(),
-            Arc::clone(&peers)
+            Arc::clone(&peers),
+            #[cfg(feature = "telemetry")]
+            self.telemetry.clone()
         );
 
         let client_overlay = Arc::new(client_overlay);
@@ -657,6 +657,11 @@ impl NodeNetwork {
         });
     }
 
+    #[cfg(feature = "telemetry")]
+    pub fn telemetry(&self) -> &FullNodeNetworkTelemetry {
+        &self.telemetry
+    }
+
     fn current_validator_set_context<'a>(&'a self) -> Option<lockfree::map::ReadGuard<'a, UInt256, ValidatorSetContext>>  {
         let id = self.validator_context.current_set.get(&0)?;
         self.validator_context.sets_contexts.get(id.val())
@@ -702,15 +707,13 @@ impl NodeNetwork {
                 .unwrap_or_default()
                 .as_secs();
             padding.extend_from_slice(&now.to_le_bytes());
-            let broadcast = TonNode_ConnectivityCheckBroadcast(Box::new(
-                ConnectivityCheckBroadcast {
-                    pub_key: int256(key_id.clone()),
-                    padding: bytes(padding),
-                }
-            ));
+            let broadcast = ConnectivityCheckBroadcast {
+                pub_key: int256(key_id.clone()),
+                padding: bytes(padding),
+            };
             overlay.val().overlay().broadcast(
                 &self.masterchain_overlay_short_id, 
-                &serialize(&broadcast)?, 
+                &serialize(&broadcast.into_boxed())?, 
                 None
             ).await
         } else {
